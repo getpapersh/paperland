@@ -1,0 +1,9 @@
+singleton WorkspaceInteraction 1.0 WorkspaceInteraction.qml
+WorkspaceLabel 1.0 WorkspaceLabel.qml
+WorkspacePreview 1.0 WorkspacePreview.qml
+WorkspaceEditor 1.0 WorkspaceEditor.qml
+WorkspaceMenu 1.0 WorkspaceMenu.qml
+QuickMenu 1.0 QuickMenu.qml
+ThumbnailSlot 1.0 ThumbnailSlot.qml
+ThumbnailContent 1.0 ThumbnailContent.qml
+WorkspaceCloseConfirm 1.0 WorkspaceCloseConfirm.qml

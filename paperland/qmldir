@@ -1,0 +1,27 @@
+singleton Theme 1.0 Theme.qml
+Service 1.0 Service.qml
+Overview 1.0 Overview.qml
+SettingsWindow 1.0 SettingsWindow.qml
+SettingsButton 1.0 SettingsButton.qml
+SettingsSwitch 1.0 SettingsSwitch.qml
+OverviewBoard 1.0 OverviewBoard.qml
+WindowSidebar 1.0 WindowSidebar.qml
+MiniStrip 1.0 MiniStrip.qml
+MiniControl 1.0 MiniControl.qml
+CanvasMap 1.0 CanvasMap.qml
+Button 1.0 Button.qml
+TextField 1.0 TextField.qml
+MinimapVisibility 1.0 MinimapVisibility.qml
+WorkspaceDialog 1.0 WorkspaceDialog.qml
+WorkspaceNames 1.0 WorkspaceNames.qml
+ActivationNotice 1.0 ActivationNotice.qml
+CoachCard 1.0 CoachCard.qml
+Onboarding 1.0 Onboarding.qml
+WelcomeCard 1.0 WelcomeCard.qml
+SwitchCardView 1.0 SwitchCardView.qml
+WorkspaceSwitchCard 1.0 WorkspaceSwitchCard.qml
+
+WindowSwitcher 1.0 WindowSwitcher.qml
+WindowSendMenu 1.0 WindowSendMenu.qml
+WhatsNew 1.0 WhatsNew.qml
+WhatsNewPanel 1.0 WhatsNewPanel.qml

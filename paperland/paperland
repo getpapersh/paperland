@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+paperland_dir=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")
+load_input_bridge() {
+  local binary="$paperland_dir/native/MinimapInput.so"
+  local stamp="$paperland_dir/native/MinimapInput.version"
+  if [[ ! -f "$binary" || ! -f "$stamp" ]]; then
+    echo "Paperland input bridge is unavailable; reinstall Paperland to enable Super-click. Click, pill, grip, and badge controls remain available. Canvas pan needs verified direction while monitor-aware integration is on." >&2
+    return 0
+  fi
+  local built_abi runtime runtime_abi plugins
+  built_abi=$(<"$stamp")
+  runtime=$(hyprctl version 2>/dev/null) || {
+    echo "Paperland could not check the Hyprland build; the input bridge was not loaded." >&2
+    return 0
+  }
+  runtime_abi=$(sed -n 's/^Version ABI string: //p' <<< "$runtime")
+  if [[ "$runtime_abi" != "$built_abi" ]]; then
+    echo "Paperland input bridge is for another Hyprland build; reinstall Paperland to enable Super-click." >&2
+    return 0
+  fi
+  plugins=$(hyprctl plugin list 2>/dev/null) || {
+    echo "Paperland could not inspect Hyprland plugins; the input bridge was not loaded." >&2
+    return 0
+  }
+  if [[ "$plugins" == *"Plugin Paperland minimap input by Paperland:"* ]]; then
+    if [[ "$plugins" != *"Version: $built_abi"* ]]; then
+      echo "An older Paperland input bridge is loaded; restart Hyprland before using Super-click." >&2
+    fi
+    return 0
+  fi
+  hyprctl plugin load "$binary" >/dev/null || echo "Paperland input bridge could not load; click, pill, grip, and badge controls remain available. Canvas pan needs verified direction while monitor-aware integration is on." >&2
+}
+action=${1:-start}
+if (( $# )); then shift; fi
+case "$action" in
+  setup)
+    setup_desktop_bridge=false
+    if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/hypr/paperland-desktop-directions.lua" ]]; then
+      setup_desktop_bridge=true
+    fi
+    for setup_arg in "$@"; do
+      case "$setup_arg" in --desktop-direction|--desktop-direction=*) setup_desktop_bridge=true ;; esac
+    done
+    if [[ "$setup_desktop_bridge" == true ]]; then
+      for setup_arg in "$@"; do
+        if [[ "$setup_arg" == "--apply" || "$setup_arg" == "--settings-apply" || "$setup_arg" == --settings-apply=* ]]; then
+          load_input_bridge
+          break
+        fi
+      done
+    fi
+    exec python3 "$paperland_dir/setup.py" "$action" "$@"
+    ;;
+  install|uninstall)
+    exec python3 "$paperland_dir/setup.py" "$action" "$@"
+    ;;
+  config)
+    exec python3 "$paperland_dir/config.py" "$@"
+    ;;
+  start)
+    load_input_bridge
+    exec env QT_QUICK_CONTROLS_STYLE=Basic quickshell --no-duplicate -p "$paperland_dir/shell.qml" "$@"
+    ;;
+  start-hidden)
+    load_input_bridge
+    exec env PAPERLAND_START_HIDDEN=1 QT_QUICK_CONTROLS_STYLE=Basic quickshell --no-duplicate -d -p "$paperland_dir/shell.qml" "$@"
+    ;;
+  demo)
+    exec env QT_QUICK_CONTROLS_STYLE=Basic quickshell --no-duplicate -p "$paperland_dir/demo.qml" "$@"
+    ;;
+  show|hide|toggle|search|settings|welcome|status|peek|pin|follow|activate|pan|direction)
+    exec quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland "$action" "$@"
+    ;;
+  instances)
+    paperland_instances=$(quickshell list -p "$paperland_dir/shell.qml" --json) || exit $?
+    # Quickshell 0.3 prints this text for an empty config even with --json.
+    if [[ $paperland_instances == "No running instances for \"$paperland_dir/shell.qml\""$'\n'"Use --all to list all instances." ]]; then
+      printf '[]\n'
+    else
+      printf '%s\n' "$paperland_instances"
+    fi
+    ;;
+  switch-overlay)
+    exec quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland switchOverlay "$@"
+    ;;
+  stop-safe)
+    exec quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland requestStop
+    ;;
+  whats-new)
+    exec quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland whatsNew "$@"
+    ;;
+  version)
+    version=""
+    if [[ -r "$paperland_dir/version.txt" ]]; then version=$(<"$paperland_dir/version.txt"); fi
+    version=${version//[[:space:]]/}
+    if [[ -z "$version" ]]; then
+      echo "Paperland version file is missing: $paperland_dir/version.txt" >&2
+      exit 1
+    fi
+    # Only a checkout rooted here (source) or one level up (Omarchy plugin package)
+    # reports a commit; an enclosing dotfiles repository must not.
+    commit=""
+    for checkout in "$paperland_dir" "$(dirname -- "$paperland_dir")"; do
+      if [[ -e "$checkout/.git" ]] && command -v git >/dev/null; then
+        commit=$(git -C "$checkout" rev-parse --short HEAD 2>/dev/null) || commit=""
+        break
+      fi
+    done
+    echo "Paperland $version${commit:+ ($commit)}"
+    ;;
+  strip-badges)
+    exec quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland stripBadges "$@"
+    ;;
+  switcher-size)
+    exec quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland switcherSize "$@"
+    ;;
+  switcher-all-displays)
+    exec quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland switcherAllDisplays "$@"
+    ;;
+  stop)
+    exec quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland quit
+    ;;
+  names)
+    names_action=${1:-}
+    if (( $# )); then shift; fi
+    case "$names_action" in
+      begin)
+        if (( $# != 1 )) || [[ ! "$1" =~ ^[1-9][0-9]*$ ]]; then
+          echo "Usage: paperland names begin WORKSPACE" >&2
+          exit 2
+        fi
+        names_arg=(paperlandNames begin "$1")
+        ;;
+      submit)
+        if (( $# != 1 )); then
+          echo "Usage: paperland names submit JSON" >&2
+          exit 2
+        fi
+        names_arg=(paperlandNames submit "$1")
+        ;;
+      status)
+        if (( $# != 1 )); then
+          echo "Usage: paperland names status REQUEST_ID" >&2
+          exit 2
+        fi
+        names_arg=(paperlandNames status "$1")
+        ;;
+      *)
+        echo "Usage: paperland names {begin WORKSPACE|submit JSON|status REQUEST_ID}" >&2
+        exit 2
+        ;;
+    esac
+
+    # Daemonization is idempotent under --no-duplicate; an existing shell is
+    # left untouched while a newly started shell receives the hidden startup
+    # marker. Each readiness probe is independently bounded.
+    timeout --signal=TERM 1s env PAPERLAND_START_HIDDEN=1 QT_QUICK_CONTROLS_STYLE=Basic quickshell --no-duplicate -d -p "$paperland_dir/shell.qml" >/dev/null 2>&1 || true
+    names_ready=0
+    names_deadline=$((SECONDS + 3))
+    while (( SECONDS < names_deadline )); do
+      names_reply=""
+      if names_reply=$(timeout --signal=TERM 1s quickshell ipc -p "$paperland_dir/shell.qml" call -- paperlandNames ready 2>&1); then :; fi
+      if [[ "$names_reply" == "true" ]]; then
+        names_ready=1
+        break
+      fi
+      sleep 0.05
+    done
+    if (( names_ready == 0 )); then
+      echo "Paperland workspace-name writer did not become ready within 3 seconds." >&2
+      exit 124
+    fi
+    names_final=""
+    names_final_rc=0
+    if names_final=$(timeout --signal=TERM 3s quickshell ipc -p "$paperland_dir/shell.qml" call -- "${names_arg[@]}" 2>&1); then
+      names_final_rc=0
+    else
+      names_final_rc=$?
+    fi
+    printf '%s\n' "$names_final"
+    # Structured replies can contain arbitrary label text, including "Error".
+    # Only unstructured output is a transport failure; the caller reads JSON status.
+    if [[ "$names_final" != \{*\} ]]; then
+      if (( names_final_rc == 0 )); then names_final_rc=1; fi
+    fi
+    exit "$names_final_rc"
+    ;;
+  *)
+    echo "Usage: paperland {install|setup|uninstall|start|start-hidden|demo|show|hide|toggle|search|settings|welcome|whats-new|version|status|peek on/off/SECONDS|pin true/false|switch-overlay on/off|switcher-size small/medium/large/xl|switcher-all-displays on/off|activate ADDRESS|pan WORKSPACE PIXELS|direction WORKSPACE right/left/up/down/global|instances|stop-safe|names {begin WORKSPACE|submit JSON|status REQUEST_ID}|config {list|get KEY|set KEY VALUE|unset KEY|reload|path}|stop}" >&2
+    exit 2
+    ;;
+esac

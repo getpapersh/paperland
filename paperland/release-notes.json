@@ -1,0 +1,23 @@
+[
+  {
+    "_draft": "DRAFT for the owner to edit before release: confirm the version, add the release date, and revise the text. Remove this key when final.",
+    "version": "0.2.0",
+    "headline": "The first public alpha of Paperland: PaperMac's minimap, overview and switcher for Hyprland's scrolling layout.",
+    "sections": [
+      {
+        "kind": "added",
+        "items": [
+          "A compact minimap strip on each display's active scrolling workspace, with workspace pills, window cards and a viewport scrubber. Open it with **Super+M** when chosen in `paperland setup`.",
+          "**Pin** and **Peek** modes: keep the strip open, or show it as you navigate and hide it after a delay.",
+          "An overview of every display and scrolling workspace, with search and a docked window list. Open it from the strip's search button or with `paperland search`.",
+          "An **Alt+Tab** switcher with screenshots of recent windows across all desktops and monitors.",
+          "Super-click several minimap cards and drag them to another Desktop, a new Desktop or **Floating**.",
+          "**Send to** from a right-click on any window preview moves a window to another workspace.",
+          "A **Scratchpad** pill for the shared scratchpad, and an optional Omarchy workspace bar with hover previews and workspace renaming.",
+          "Guided setup with `paperland setup` for shortcuts, column resizing, startup at login and display-aware scrolling direction.",
+          "This **What's New** window and `paperland version`."
+        ]
+      }
+    ]
+  }
+]

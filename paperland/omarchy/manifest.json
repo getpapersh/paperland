@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "json.paperland",
+  "name": "Paperland",
+  "version": "0.2.0",
+  "author": "json",
+  "description": "Native workspace labels, interactive previews and Paperland minimap access.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Widget.qml" },
+  "barWidget": {
+    "displayName": "Paperland",
+    "category": "Compositor",
+    "defaultSection": "left",
+    "allowMultiple": false
+  }
+}

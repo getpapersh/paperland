@@ -1,0 +1,4 @@
+singleton Runtime 1.0 Runtime.qml
+NameClient 1.0 NameClient.qml
+WindowThumbnail 1.0 WindowThumbnail.qml
+singleton PreviewControl 1.0 PreviewControl.qml
