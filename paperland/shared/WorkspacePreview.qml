@@ -4,6 +4,7 @@ import QtQuick.Controls as QQC
 import ".." as Paper
 import "../Layout.js" as Layout
 import "PreviewGeometry.js" as Geometry
+import "CaptureReport.js" as CaptureReport
 
 FocusScope {
   id: root
@@ -17,6 +18,31 @@ FocusScope {
   function changeZoom(factor: real): void { map.changeZoom(factor); }
   function fit(): void { map.fit(); }
   function currentView(): void { map.currentView(); }
+  // Capture-report records while the preview is shown; its hosts enable
+  // capture exactly then. The list form has no scrolling row, so its records
+  // never claim parked. Undelegated list rows have no slot to report.
+  function captureRecords(surface: string): var {
+    if (!captureEnabled) return [];
+    if (row) return map.captureRecords(surface);
+    var records = [];
+    for (var i = 0; i < addresses.length; i++) {
+      var address = addresses[i];
+      var window = items.find(function(w) { return w.address === address; }) || null;
+      var record = CaptureReport.slotRecord(surface, entry, false, i, window, listSlot(i));
+      if (record) records.push(record);
+    }
+    return records;
+  }
+  function listSlot(index: int): ThumbnailSlot {
+    var card = windowList.itemAtIndex(index) as QQC.ItemDelegate;
+    if (!card || !card.contentItem) return null;
+    var children = card.contentItem.children;
+    for (var i = 0; i < children.length; i++) {
+      var slot = children[i] as ThumbnailSlot;
+      if (slot) return slot;
+    }
+    return null;
+  }
   readonly property real chromeHeight: workspaceLabel.height + monitorLabel.height + footer.height + 24
   readonly property real bodyHeight: spacious ? Math.max(0, height - chromeHeight) : Math.max(80, height - 90)
   readonly property real desiredWidth: row ? row.bounds.width * map.preferredScale + 14 : 720
@@ -26,7 +52,11 @@ FocusScope {
   property var entry: null
   property var row: null
   property var badgeAddresses: []
+  property var urgentAddresses: ({})
   property string focusedAddress: ""
+  // Pill icon hover cross-highlights this exact address in the map, without
+  // focusing, panning or claiming the keyboard selection.
+  property string highlightAddress: ""
   property bool keyboardMode: false
   property bool externalControl: false
   readonly property real mapZoom: map.zoom
@@ -135,7 +165,9 @@ FocusScope {
       nameFor: root.nameFor
       row: root.row
       badgeAddresses: root.badgeAddresses
+      urgentAddresses: root.urgentAddresses
       focusedAddress: root.focusedAddress
+      highlightAddress: root.highlightAddress
       selectedAddress: root.selectedAddress
       live: false
       externalControl: root.externalControl
@@ -172,13 +204,15 @@ FocusScope {
         id: listCard
         required property string modelData
         readonly property var window: root.items.find(function(w) { return w.address === listCard.modelData; }) || ({app: "", title: ""})
+        readonly property bool urgent: modelData !== root.focusedAddress && !!root.urgentAddresses[modelData]
         required property int index
         readonly property var imageSize: root.listImage(modelData)
         width: windowList.contentWidth
         height: root.thumbnailSource.toString() ? (root.spacious ? imageSize.height + topPadding + bottomPadding : 92) : 44
         focusPolicy: Qt.NoFocus
+        objectName: "preview-row-" + modelData
         text: root.nameFor(window.app) + " · " + window.title
-        Accessible.name: text
+        Accessible.name: text + (urgent ? ", needs attention" : "")
         highlighted: root.keyboardMode && root.selectedIndex === index
         onClicked: root.activated(modelData)
         TapHandler { acceptedButtons: Qt.RightButton; onTapped: eventPoint => root.windowMenuRequested(listCard.modelData, listCard.mapToItem(null, eventPoint.position.x, eventPoint.position.y)) }
@@ -201,6 +235,13 @@ FocusScope {
             spacing: 3
             Text { width: parent.width; text: root.nameFor(listCard.window.app); textFormat: Text.PlainText; elide: Text.ElideRight; color: root.foreground; font.bold: true; font.pixelSize: 13 }
             Text { width: parent.width; text: listCard.window.title; textFormat: Text.PlainText; elide: Text.ElideRight; color: root.foreground; opacity: 0.7; font.pixelSize: 11 }
+          }
+          // Declared after the thumbnail: a loaded image paints over anything
+          // declared earlier.
+          UrgentDot {
+            objectName: "preview-urgent-" + listCard.modelData
+            anchors { left: parent.left; top: parent.top; margins: 3 }
+            visible: listCard.urgent
           }
         }
         background: Rectangle { color: listCard.highlighted ? "#454545" : "transparent"; radius: 5 }

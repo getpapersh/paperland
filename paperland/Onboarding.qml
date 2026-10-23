@@ -22,6 +22,10 @@ Item {
     var monitor = Hyprland.focusedMonitor;
     return Quickshell.screens.find(function(screen) { return !!monitor && screen.name === monitor.name; }) || null;
   }
+  // A removed display leaves its screen object behind; only a listed one is usable.
+  function liveScreen(screen: var): var {
+    return Quickshell.screens.find(function(candidate) { return candidate === screen; }) || null;
+  }
   function openWelcome(): void {
     // A replay restarts the tour, so an earlier run must not keep crediting.
     closeCoach();
@@ -65,7 +69,7 @@ Item {
   function startCoach(): void {
     coach = { index: 0, reps: 0, feedback: "", done: false };
     shownLesson = "scroll";
-    coachScreen = welcomeScreen || focusedScreen();
+    coachScreen = liveScreen(welcomeScreen) || focusedScreen();
     observeFocus();
     coachOpen = true;
   }
@@ -118,8 +122,10 @@ Item {
     }
   }
   PanelWindow {
-    screen: root.coachScreen
-    visible: root.coachOpen
+    screen: root.liveScreen(root.coachScreen) || root.focusedScreen()
+    // Same latch and re-show as the welcome card; see welcomeWindow.
+    onScreenChanged: if (root.coachOpen && screen && screen !== root.coachScreen) root.coachScreen = screen
+    visible: root.coachOpen && !!screen
     anchors { top: true }
     margins { top: 48 }
     implicitWidth: coachCard.implicitWidth
@@ -150,8 +156,15 @@ Item {
     // Clicked and still under the pointer.
     property bool engaged: false
     // Before Hyprland reports a monitor at startup, follow it until one exists.
-    screen: root.welcomeScreen || root.focusedScreen()
-    visible: root.welcomeOpen
+    screen: root.liveScreen(root.welcomeScreen) || root.focusedScreen()
+    // Latch the display the card first lands on, so a later focus change cannot move it.
+    onScreenChanged: {
+      if (!root.welcomeOpen || !screen) return;
+      if (screen !== root.welcomeScreen) root.welcomeScreen = screen;
+    }
+    // Reading `screen` re-shows the card on its new display: Quickshell hides a
+    // window whose display vanished without re-evaluating a plain binding.
+    visible: root.welcomeOpen && !!screen
     onVisibleChanged: engaged = false
     implicitWidth: card.implicitWidth
     implicitHeight: card.implicitHeight

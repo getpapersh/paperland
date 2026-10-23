@@ -15,6 +15,12 @@ Item {
   property color foreground: "#c0c0c0"
   property string fontFamily: "sans-serif"
   property real fontSize: 11
+  // A scratchpad client requested attention and has not been focused since.
+  // Computed by the surface from the shared entry, which every display's pill
+  // represents; the closed scratchpad marks everywhere.
+  property bool urgent: false
+  // The portrait rail's full-width pill would clip an overhanging badge.
+  property bool badgeInside: false
   readonly property string accessibleName: label.accessibleName
   readonly property bool shown: pillEnabled && !!entry && (entry.count > 0 || open)
   implicitWidth: label.implicitWidth + 14
@@ -24,9 +30,12 @@ Item {
   visible: shown
   signal toggled()
   signal menuRequested(point position)
+  // Set by hosts that scroll a column with this pill; otherwise the wheel passes to the parent.
+  property bool consumesWheel: false
+  signal wheelMoved(int delta)
 
   Accessible.role: Accessible.Button
-  Accessible.name: accessibleName
+  Accessible.name: accessibleName + (urgent ? ", needs attention" : "")
   Accessible.selected: open
   Accessible.onPressAction: root.toggled()
 
@@ -56,6 +65,16 @@ Item {
     fontSize: root.fontSize
     maximumWidth: 180
   }
+  UrgentDot {
+    // A badge on the visible pill's top-right corner, clear of the raised
+    // count, and declared after the opaque background so it paints above it.
+    objectName: "scratchpad-urgent"
+    x: background.x + background.width - (root.badgeInside ? width : 4)
+    y: background.y
+    z: 5
+    diameter: 6
+    visible: root.urgent
+  }
   MouseArea {
     anchors.fill: parent
     cursorShape: Qt.PointingHandCursor
@@ -64,6 +83,10 @@ Item {
       if (event.button === Qt.RightButton)
         root.menuRequested(mapToItem(null, event.x, event.y));
       else root.toggled();
+    }
+    onWheel: function(wheel) {
+      if (root.consumesWheel) root.wheelMoved(wheel.angleDelta.y);
+      else wheel.accepted = false;
     }
   }
 }

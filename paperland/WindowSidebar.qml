@@ -13,6 +13,7 @@ ColumnLayout {
   property var rowIds: []
   property var windows: ({})
   property var badgeAddresses: []
+  property var urgentAddresses: ({})
   property string query: ""
   property string scope: "all"
   property string scopeMonitor: ""
@@ -227,6 +228,7 @@ ColumnLayout {
       border.width: selected ? 1 : 0
       border.color: Theme.accent
       readonly property int badgeNumber: root.badgeAddresses.indexOf(modelData.address) + 1
+      readonly property bool urgent: !focused && !!root.urgentAddresses[modelData.address]
       Shared.StripBadge {
         objectName: "sidebar-badge-" + windowCard.modelData.address
         anchors { right: parent.right; top: parent.top; margins: 3 }
@@ -234,10 +236,17 @@ ColumnLayout {
         visible: windowCard.badgeNumber > 0 && windowCard.badgeNumber <= 9
         number: windowCard.badgeNumber
       }
+      Shared.UrgentDot {
+        objectName: "sidebar-urgent-" + windowCard.modelData.address
+        anchors { left: parent.left; top: parent.top; margins: 4 }
+        z: 2
+        visible: windowCard.urgent
+      }
       Accessible.role: Accessible.Button
       Accessible.selected: selected
       Accessible.name: window ? window.title + ", " + root.nameFor(window.app) + ", " + window.monitor + ", workspace " + window.workspaceId + ", " + detailState
-        + (windowCard.badgeNumber > 0 && windowCard.badgeNumber <= 9 ? ", number " + windowCard.badgeNumber : "") : ""
+        + (windowCard.badgeNumber > 0 && windowCard.badgeNumber <= 9 ? ", number " + windowCard.badgeNumber : "")
+        + (urgent ? ", needs attention" : "") : ""
       Accessible.onPressAction: root.activated(modelData.address)
       RowLayout {
         anchors.fill: parent

@@ -6,20 +6,28 @@ import "Switcher.js" as Switcher
 import "shared/WorkspaceCatalog.js" as Catalog
 import "shared/Scratchpad.js" as Scratchpad
 import "shared/WindowDestinations.js" as Destinations
+import "shared/Urgency.js" as Urgency
+import "shared/ClosedWindows.js" as ClosedWindows
 import "NamesLogic.js" as Names
 
 Item {
   id: root
   property bool expanded: false
+  // Windows the compositor reported closed. Quickshell's Hyprland model removes
+  // a window only on its closewindow event, so a refresh reply requested before
+  // a close and applied after it recreates the window as a ghost; every list
+  // below is built from the clients that are not recorded as closed.
+  property var closedWindows: ({})
+  readonly property var liveClients: ClosedWindows.live(
+    Hyprland.toplevels.values.map(function(w) { return w.lastIpcObject; }), closedWindows)
   readonly property var allWindows: Switcher.windows(
-    Hyprland.toplevels.values.map(function(w) { return w.lastIpcObject; }),
+    liveClients,
     Hyprland.monitors.values.map(function(m) { return m.lastIpcObject; }))
   readonly property var catalog: Catalog.build(
     Hyprland.monitors.values.map(function(m) { return m.lastIpcObject; }),
     Hyprland.workspaces.values.map(function(w) { return w.lastIpcObject; }),
-    Hyprland.toplevels.values.map(function(w) { return w.lastIpcObject; }))
-  readonly property var scratchpadEntry: Scratchpad.build(
-    Hyprland.toplevels.values.map(function(w) { return w.lastIpcObject; }))
+    liveClients)
+  readonly property var scratchpadEntry: Scratchpad.build(liveClients)
   property var scratchpadBinding: null
   // Live `hyprctl -j binds`, for showing the shortcuts the user actually has.
   property var bindings: []
@@ -69,10 +77,12 @@ Item {
   property var groupStacks: []
   property string groupSourceFocus: ""
   property string groupFailureReason: ""
+  // Desktop removal moves and lands focus itself; the group engine must not re-focus the source.
+  property bool groupSkipRestore: false
   signal groupFinished(bool success)
 
   function moveGroup(addresses: var, workspace: int, source: int, reorder: var, selectedIds: var, offered: var): bool {
-    if (moveBusy || groupActive) return false;
+    if (moveBusy || groupActive || (removal && !removalCalling)) return false;
     groupNotice = "";
     var row = rows[source];
     var destination = reorder && workspace === source ? { kind: "reorder" }
@@ -116,6 +126,8 @@ Item {
       if (!plan.steps.length) { moveMessage = "Already in that position."; groupFinished(true); return true; }
       return runGroupReorder(plan, source, targets);
     }
+    // Sent to a Desktop whose focused window is tiled, windows arrive reversed; dispatch order compensates.
+    targets = Catalog.groupDispatchOrder(targets, destination, catalog.entries);
     groupTargets = targets; groupDestination = destination; groupSource = source;
     groupSourceSelector = row.name === "special:scratchpad" ? row.name : String(source);
     groupSourceMonitor = row.monitor;
@@ -257,10 +269,11 @@ Item {
   function finishGroup(success: bool, message: string): void {
     groupRowWait.stop();
     groupActive = false; moveBusy = false; moveMessage = message; groupNotice = message;
-    Hyprland.dispatch('function() ' + sourceRestoreCode() + 'end');
+    if (!groupSkipRestore) Hyprland.dispatch('function() ' + sourceRestoreCode() + 'end');
     groupFinished(success);
   }
   function sourceRestoreCode(): string {
+    if (groupSkipRestore) return "";
     return 'hl.dispatch(hl.dsp.focus({monitor=' + Names.luaQuote(groupSourceMonitor) + '})); '
       + (groupSource < 0 ? 'if hl.get_workspace("special:scratchpad") then ' : '')
       + 'hl.dispatch(hl.dsp.focus({workspace=' + Names.luaQuote(groupSourceSelector) + '})); '
@@ -316,9 +329,150 @@ Item {
     });
   }
 
+
+  // ---- Remove Desktop. Hyprland has no remove action: move the windows out, make sure no display
+  // shows the Desktop, then read back whether it is gone.
+  property var removal: null
+  signal removalFinished(var outcome)
+  function allEntries(): var { return Object.keys(catalog.entries).map(function(id) { return catalog.entries[id]; }); }
+  // True once the outcome has been reported through removalFinished.
+  function failRemoval(title: string, detail: string): bool {
+    removal = null; groupSkipRestore = false; removalWatchdog.stop();
+    removalFinished({ ok: false, retry: false, title: title, detail: detail });
+    return true;
+  }
+  // True while the removal itself drives the move engine; every other caller is refused until it finishes.
+  property bool removalCalling: false
+  Timer { id: removalWatchdog; interval: 60000; onTriggered: root.abortRemoval() }
+  // A removal always ends in a result, even if a move process never reports back.
+  function abortRemoval(): void {
+    var r = removal;
+    if (!r) return;
+    groupRowWait.stop(); moveCheck.stop(); removalPoll.stop();
+    moveProcess.running = false;
+    groupActive = false; moveBusy = false; groupSkipRestore = false; removal = null;
+    refresh();
+    removalFinished({ ok: false, retry: true, title: "Desktop " + r.source + " may not have been removed",
+      detail: "Hyprland did not finish in time. Nothing was closed. Check the Desktop, then try again." });
+  }
+  /** @param {number} sourceId @param {Object} destination Native destination record the card offered.
+   * @param {{address:string, stableId:string, floating:boolean}[]} targets The windows the card counted.
+   * @returns {boolean} False only when another move is running and nothing was reported or started. */
+  function removeDesktop(sourceId: int, destination: var, targets: var): bool {
+    if (removal || moveBusy || groupActive) return false;
+    var entry = catalog.entries[sourceId], all = allEntries();
+    var current = destinations.find(function(d) {
+      return d.kind === "existing" && destination && d.id === destination.id && d.name === destination.name
+        && d.monitor === destination.monitor && d.selector === destination.selector;
+    });
+    if (!entry || !Catalog.removeAvailability(entry, all).enabled) return failRemoval("Desktop " + sourceId + " was not removed", "Hyprland cannot remove it now. No window was moved.");
+    if (!current || current.id === sourceId) return failRemoval("Desktop " + sourceId + " was not removed", "The destination changed. No window was moved. Choose it again.");
+    // Windows that left the Desktop since the card counted them are not this removal's to move.
+    var here = targets.filter(function(w) {
+      var live = allWindows[w.address];
+      return live && live.stableId === w.stableId && live.workspaceId === sourceId;
+    });
+    var row = rows[sourceId];
+    var scrolling = !!row && row.windows.length > 0;
+    var inRow = scrolling ? row.windows.map(function(w) { return w.address; }) : [];
+    var tiled = here.filter(function(w) { return !w.floating && inRow.indexOf(w.address) >= 0; });
+    // Anything the group engine cannot place (floating, non-scrolling, or not yet in the row) moves on its own.
+    var singles = here.filter(function(w) { return tiled.indexOf(w) < 0; });
+    var priorWindow = allWindows[focusedAddress];
+    removal = { source: sourceId, destination: current, snapshot: targets.map(function(w) { return { stableId: w.stableId, floating: w.floating }; }),
+      tiled: tiled, singles: singles, index: 0, phase: "tiled", polls: 0, monitor: entry.monitor,
+      landing: Catalog.removeLanding(entry, all, current),
+      priorMonitor: focusedMonitor, priorWindow: priorWindow ? priorWindow.stableId : "",
+      clients: [], movedAll: true };
+    groupSkipRestore = true;
+    removalWatchdog.restart();
+    runRemovalTiled();
+    return true;
+  }
+  function runRemovalTiled(): void {
+    var r = removal;
+    if (!r.tiled.length) { r.phase = "singles"; runRemovalSingle(); return; }
+    var ids = {}, order = rows[r.source].windows.map(function(w) { return w.address; })
+      .filter(function(a) { return r.tiled.some(function(w) { return w.address === a; }); });
+    r.tiled.forEach(function(w) { ids[w.address] = w.stableId; });
+    removalCalling = true;
+    var started = moveGroup(order, r.destination.id, r.source, null, ids, r.destination);
+    removalCalling = false;
+    if (!started) { r.movedAll = false; startRemovalVerify(); }
+  }
+  function runRemovalSingle(): void {
+    var r = removal;
+    if (r.index >= r.singles.length) { finishRemovalMoves(); return; }
+    var w = r.singles[r.index];
+    removalCalling = true;
+    var started = moveWindow({ address: w.address, stableId: w.stableId, sourceWorkspace: r.source }, r.destination, false);
+    removalCalling = false;
+    if (!started) { r.movedAll = false; startRemovalVerify(); }
+  }
+  function finishRemovalMoves(): void {
+    var r = removal;
+    var restore = r.priorMonitor && !(r.landing && r.monitor === r.priorMonitor);
+    var code = 'function() ';
+    if (r.landing) code += 'local d=hl.get_workspace("' + r.landing + '"); if not d or d.id~=' + r.landing
+      + ' then error("The landing Desktop changed.") end; hl.dispatch(hl.dsp.focus({workspace="' + r.landing + '"})); ';
+    if (restore) {
+      code += 'hl.dispatch(hl.dsp.focus({monitor=' + Names.luaQuote(r.priorMonitor) + '})); ';
+      if (r.priorWindow && /^[0-9a-f]+$/i.test(r.priorWindow) && !r.snapshot.some(function(w) { return w.stableId === r.priorWindow; }))
+        code += 'local p=hl.get_window("stableid:' + r.priorWindow + '"); if p then hl.dispatch(hl.dsp.focus({window=p})) end; ';
+    }
+    r.phase = "land";
+    if (code === 'function() ') { startRemovalVerify(); return; }
+    runMove("remove-land", ["hyprctl", "dispatch", code + 'end']);
+  }
+  function startRemovalVerify(): void {
+    removal.phase = "verify";
+    runMove("remove-clients", ["hyprctl", "-j", "clients"]);
+  }
+  Timer { id: removalPoll; interval: 150; onTriggered: if (root.removal) root.startRemovalVerify() }
+  function receiveRemoval(code: int): bool {
+    if (!removal || movePhase.indexOf("remove-") !== 0) return false;
+    if (movePhase === "remove-land") { startRemovalVerify(); return true; }
+    if (movePhase === "remove-clients") {
+      try { removal.clients = code === 0 ? JSON.parse(moveOutput) : []; } catch (error) { removal.clients = []; }
+      runMove("remove-workspaces", ["hyprctl", "-j", "workspaces"]);
+      return true;
+    }
+    var workspaces;
+    try { workspaces = code === 0 ? JSON.parse(moveOutput) : null; } catch (error) { workspaces = null; }
+    var r = removal;
+    if (!Array.isArray(workspaces) || !r.clients.length && r.snapshot.length) {
+      removal = null; groupSkipRestore = false; removalWatchdog.stop();
+      removalFinished({ ok: false, retry: true, title: "Desktop " + r.source + " may not have been removed",
+        detail: "Hyprland did not report its state. Check the Desktop, then try again. No window was closed." });
+      return true;
+    }
+    var vertical = rows[r.destination.id] ? rows[r.destination.id].vertical : false;
+    var result = Catalog.removeReadback(r.source, r.destination.id, r.snapshot, r.clients, workspaces, vertical);
+    // Hyprland deletes an emptied Desktop right after it stops being shown; allow a short settle.
+    if (!result.removed && r.movedAll && result.remaining + result.arrived === 0 && ++r.polls < 8) { removalPoll.restart(); return true; }
+    removal = null; groupSkipRestore = false; removalWatchdog.stop();
+    refresh();
+    removalFinished(Catalog.removeOutcome(result, r.source, r.destination.id));
+    return true;
+  }
+  Connections {
+    target: root
+    function onGroupFinished(success) {
+      if (!root.removal || root.removal.phase !== "tiled") return;
+      if (!success) root.removal.movedAll = false;
+      root.removal.phase = "singles";
+      if (success) root.runRemovalSingle(); else root.startRemovalVerify();
+    }
+    function onMoveFinished(success) {
+      if (!root.removal || root.removal.phase !== "singles") return;
+      if (!success) { root.removal.movedAll = false; root.startRemovalVerify(); return; }
+      root.removal.index++;
+      root.runRemovalSingle();
+    }
+  }
   function cancelActivationCheck(): void { activationCheck.stop(); }
   function moveWindow(target: var, destination: var, follow: bool): bool {
-    if (groupActive) return false;
+    if (groupActive || (removal && !removalCalling)) return false;
     return dispatchWindow(target, destination, follow);
   }
   function dispatchWindow(target: var, destination: var, follow: bool): bool {
@@ -358,6 +512,7 @@ Item {
     } else moveFinished(success);
   }
   function receiveMove(code: int): void {
+    if (receiveRemoval(code)) return;
     if (movePhase === "group-failure-verify") {
       var clients;
       try { clients = code === 0 ? JSON.parse(moveOutput) : []; }
@@ -512,6 +667,15 @@ Item {
   property var rows: ({})
   property var windows: ({})
   property var stripBadgeAddresses: []
+  // Native events own the attention lifecycle. Updating this snapshot must
+  // not refresh navigation state or reveal a strip.
+  property var urgentAddresses: ({})
+  // When each record arrived, so layout changes can drop records for windows
+  // that no longer exist (never-mapped requests, reused heap addresses).
+  property var urgentSince: ({})
+  // Workspace aggregation for pill marks, over the same catalog identities
+  // the pills themselves represent. A derived snapshot, never a second owner.
+  readonly property var urgentByWorkspace: Urgency.forWorkspaces(urgentAddresses, catalog.windows, focusedAddress)
   property real pendingPan: 0
   property int pendingWorkspace: 0
   property string lastFocusedAddress: ""
@@ -523,14 +687,31 @@ Item {
   readonly property var layout: Layout.build(
     Hyprland.monitors.values.map(function(m) { return m.lastIpcObject; }),
     Hyprland.workspaces.values.map(function(w) { return w.lastIpcObject; }),
-    Hyprland.toplevels.values.map(function(w) { return w.lastIpcObject; }),
+    liveClients,
     Object.assign({ global: globalDirection, managed: managedDirection }, workspaceDirections))
+
+  // A ghost the model still holds keeps its record, a reused address clears it on openwindow.
+  function pruneClosedWindows(): void {
+    var retained = ClosedWindows.retain(root.closedWindows, Hyprland.toplevels.values.map(function(w) {
+      return "0x" + String(w.address).replace(/^0x/, "").toLowerCase();
+    }), Date.now(), 5000);
+    if (retained !== root.closedWindows) root.closedWindows = retained;
+  }
 
   onLayoutChanged: {
     var prior = root.rows[root.pendingWorkspace];
     var current = layout.rows[root.pendingWorkspace];
     root.rows = layout.rows;
     root.windows = layout.windows;
+    var pruned = Urgency.prune(root.urgentAddresses, root.urgentSince, Urgency.mapped(liveClients), Date.now(), 5000);
+    if (pruned.urgent !== root.urgentAddresses) {
+      root.urgentAddresses = pruned.urgent;
+      root.urgentSince = pruned.since;
+    }
+    // Forget a closed window once the model no longer holds it. Replacing
+    // closedWindows re-evaluates liveClients and layout, so it must not happen
+    // inside layout's own change handler (binding loop).
+    Qt.callLater(root.pruneClosedWindows);
     // Keep delegates mounted during IPC refreshes so a viewport drag is not
     // destroyed underneath the pointer when window positions change.
     if (JSON.stringify(root.rowIds) !== JSON.stringify(layout.ids)) root.rowIds = layout.ids;
@@ -858,6 +1039,21 @@ Item {
   Connections {
     target: Hyprland
     function onRawEvent(event) {
+      var closed = ClosedWindows.note(root.closedWindows, event.name, event.data, Date.now());
+      if (closed !== root.closedWindows) root.closedWindows = closed;
+      var previous = root.urgentAddresses;
+      var urgent = Urgency.reduce(previous, event.name, event.data);
+      if (urgent !== previous) {
+        var since = Object.assign({}, root.urgentSince);
+        Object.keys(urgent).forEach(function(address) {
+          if (!(address in previous) && !(address in since)) since[address] = Date.now();
+        });
+        Object.keys(since).forEach(function(address) {
+          if (!(address in urgent)) delete since[address];
+        });
+        root.urgentSince = since;
+        root.urgentAddresses = urgent;
+      }
       if (["renameworkspace", "workspacev2", "createworkspacev2", "destroyworkspacev2", "moveworkspacev2", "activespecialv2", "openwindow", "closewindow", "movewindowv2", "changefloatingmode"].indexOf(event.name) >= 0) refreshLater.restart();
       if (event.name === "configreloaded") {
         if (!directionQuery.running) directionQuery.running = true;

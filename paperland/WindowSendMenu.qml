@@ -17,22 +17,34 @@ Item {
   property var menuScreen: null
   property string openingMonitor: ""
   property bool submitting: false
+  // Keys reach the menu, its open submenu or the form only through their
+  // PopupWindow, never the layer window. Qt reports an active focus item only for
+  // its focus window; a root or content item means nothing there takes keys yet.
+  // Whether the compositor routes the keyboard here at all is a separate question.
+  readonly property Item focusItem: popupWindow.contentItem.Window.activeFocusItem
+  readonly property bool keyboardReady: opened && !submitting && !!focusItem && !!focusItem.parent
+    && focusItem !== popupWindow.contentItem
+  readonly property var focusState: ({ submitting: submitting, focusItem: focusItem ? String(focusItem.objectName || focusItem) : "",
+    menuVisible: menu.visible, menuFocus: menu.activeFocus, formVisible: form.visible, formFocus: form.activeFocus })
   // The minimap that opened the menu; it alone offers selection actions.
   property var selectionHost: null
   readonly property bool hasSelection: !!selectionHost && selectionHost.selectedInOrder().length > 0
   signal starting()
   readonly property var contentItem: popupWindow.contentItem.QQC.Overlay.overlay
   property point anchorPoint: Qt.point(8, 8)
+  // The bar slab beside the screen edge the menu was invoked from; menus stay clear of it.
+  property var insets: ({ left: 0, top: 0, right: 0, bottom: 0 })
   property var destinationsSnapshot: []
   readonly property var monitors: destinationsSnapshot.reduce(function(names, d) { if (names.indexOf(d.monitor) < 0) names.push(d.monitor); return names; }, [])
 
-  function openFor(address: string, screen: var, position: point): void {
+  function openFor(address: string, screen: var, position: point, slab: var): void {
     if (service.moveBusy || service.groupActive || !service.allWindows[address]) return;
     service.cancelActivationCheck();
     target = service.allWindows[address];
     destination = null; selectionHost = null; openingMonitor = service.focusedMonitor;
     menuScreen = screen || Quickshell.screens.find(function(s) { return s.name === root.openingMonitor; }) || Quickshell.screens[0];
     anchorPoint = position;
+    insets = slab || { left: 0, top: 0, right: 0, bottom: 0 };
     destinationsSnapshot = service.destinations.map(function(d) { return Object.assign({}, d); });
     service.moveMessage = ""; numberInput.text = "";
     starting(); opened = true;
@@ -66,7 +78,6 @@ Item {
     if (!chosen) { service.moveMessage = "Choose a destination."; showForm(); return; }
     send.destination = chosen; send.follow = follow;
     submitting = true; menu.dismiss(); form.close();
-    // Release the exclusive layer before native follow can focus the client.
     send.restart();
   }
   Timer {
@@ -88,9 +99,12 @@ Item {
   }
   component Menu: QQC.Menu {
     popupType: QQC.Popup.Item
-    width: Math.min(280, window.width - 16)
-    height: Math.min(implicitHeight, window.height - 16)
-    margins: 8
+    width: Math.min(280, window.width - 16 - root.insets.left - root.insets.right)
+    height: Math.min(implicitHeight, window.height - 16 - root.insets.top - root.insets.bottom)
+    leftMargin: 8 + root.insets.left
+    topMargin: 8 + root.insets.top
+    rightMargin: 8 + root.insets.right
+    bottomMargin: 8 + root.insets.bottom
     padding: 5
     delegate: QQC.MenuItem { objectName: subMenu ? subMenu.objectName : "" }
     palette.window: "#272727"; palette.windowText: "#eeeeee"
@@ -107,7 +121,10 @@ Item {
     exclusionMode: ExclusionMode.Ignore
     WlrLayershell.namespace: "paperland-window-send"
     WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: root.opened && !root.submitting ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
+    // Release the exclusive layer before native follow can focus the client. A
+    // plain send keeps it: a mapped layer's None-to-Exclusive switch after a
+    // rejection does not reliably return the keyboard, stranding the error form.
+    WlrLayershell.keyboardFocus: root.opened && !(root.submitting && send.follow) ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
     PopupWindow {
       id: popupWindow
       visible: root.opened && !root.submitting
@@ -217,10 +234,10 @@ Item {
         id: form
         objectName: "send-form"
         popupType: QQC.Popup.Item
-        x: Math.max(8, Math.min(root.anchorPoint.x, window.width - width - 8))
-        y: Math.max(8, Math.min(root.anchorPoint.y, window.height - height - 8))
-        width: Math.min(360, window.width - 16)
-        height: Math.min(implicitHeight, window.height - 16)
+        x: Math.max(8 + root.insets.left, Math.min(root.anchorPoint.x, window.width - width - 8 - root.insets.right))
+        y: Math.max(8 + root.insets.top, Math.min(root.anchorPoint.y, window.height - height - 8 - root.insets.bottom))
+        width: Math.min(360, window.width - 16 - root.insets.left - root.insets.right)
+        height: Math.min(implicitHeight, window.height - 16 - root.insets.top - root.insets.bottom)
         padding: 12; focus: true
         closePolicy: root.submitting ? QQC.Popup.NoAutoClose : QQC.Popup.CloseOnEscape | QQC.Popup.CloseOnPressOutside
         onClosed: if (!root.submitting && !menu.visible) root.close()

@@ -25,3 +25,4 @@ WindowSwitcher 1.0 WindowSwitcher.qml
 WindowSendMenu 1.0 WindowSendMenu.qml
 WhatsNew 1.0 WhatsNew.qml
 WhatsNewPanel 1.0 WhatsNewPanel.qml
+SettingsFile 1.0 SettingsFile.qml

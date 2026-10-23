@@ -6,4 +6,6 @@ WorkspaceMenu 1.0 WorkspaceMenu.qml
 QuickMenu 1.0 QuickMenu.qml
 ThumbnailSlot 1.0 ThumbnailSlot.qml
 ThumbnailContent 1.0 ThumbnailContent.qml
+UrgentDot 1.0 UrgentDot.qml
 WorkspaceCloseConfirm 1.0 WorkspaceCloseConfirm.qml
+DesktopRemoveCard 1.0 DesktopRemoveCard.qml

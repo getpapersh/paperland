@@ -49,6 +49,42 @@ function imageSize(aspect, availableWidth, preferred) {
   return {width: edge * Math.max(1, ratio), height: edge * Math.max(1, 1 / ratio)};
 }
 
+/** @typedef {{x: number, y: number, width: number, height: number}} Rect */
+
+/**
+ * The hovered bar pill and its open card in the compositor's global logical
+ * space, where `hyprctl -j cursorpos` reports. Bar placement mirrors Widget
+ * openPreviewMenu: the window spans from each anchored screen edge inward by
+ * its margins, so a top or left bar starts at the margin and a bottom or right
+ * bar ends one window size before the far edge.
+ * @param {{width: number, height: number, anchors: {left: boolean, top: boolean}, margins: {left: number, top: number, right: number, bottom: number}}} bar
+ * @param {{x: number, y: number, width: number, height: number}} screen The bar's screen in global logical coordinates.
+ * @param {Rect} pill Anchor item position within the bar window and its size.
+ * @param {Rect} card The popup anchor rectangle and size, in bar window coordinates.
+ * @returns {Rect[]}
+ */
+function hoverRects(bar, screen, pill, card) {
+  var x = screen.x + (bar.anchors.left ? bar.margins.left : screen.width - bar.width - bar.margins.right);
+  var y = screen.y + (bar.anchors.top ? bar.margins.top : screen.height - bar.height - bar.margins.bottom);
+  return [
+    {x: x + pill.x, y: y + pill.y, width: pill.width, height: pill.height},
+    {x: x + card.x, y: y + card.y, width: card.width, height: card.height}];
+}
+
+/**
+ * Whether the compositor cursor rests inside the hovered pill or its card.
+ * All rects share the cursor's global logical space; edges are inclusive so a
+ * pointer on the pill's last pixel still counts as hovering it.
+ * @param {{x: number, y: number}} cursor From `hyprctl -j cursorpos`.
+ * @param {Rect[]} rects The pill and the card, global.
+ * @returns {boolean}
+ */
+function cursorInside(cursor, rects) {
+  return rects.some(function(r) {
+    return cursor.x >= r.x && cursor.x <= r.x + r.width && cursor.y >= r.y && cursor.y <= r.y + r.height;
+  });
+}
+
 /** Scale a size down uniformly to fit a bounding box; never scales up.
  * Unlike imageSize, this may go below the 160-pixel edge: a passive popover
  * cannot scroll, so the screen wins.

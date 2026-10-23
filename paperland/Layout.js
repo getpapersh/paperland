@@ -143,7 +143,7 @@ function build(monitors, workspaces, clients, directions) {
         focusOrder: c.focusHistoryID,
         rect: rect, workspaceId: workspace.id, monitor: monitor.name,
         inView: active && intersects(rect, viewport), visible: active && !c.hidden && c.visible !== false && intersects(rect, viewport), floating: c.floating,
-        pinned: c.pinned, fullscreen: c.fullscreen > 0,
+        pinned: c.pinned, fullscreen: c.fullscreen > 0, hidden: !!c.hidden,
         groupSize: c.grouped ? c.grouped.length : 0
       };
       windows[c.address] = window;

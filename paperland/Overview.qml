@@ -47,6 +47,9 @@ Item {
   function activateFromMinimap(address) { if (service) service.activate(address); }
   readonly property var overviewItem: board
   readonly property bool workspaceActionsOpened: workspaceDialog.opened
+  readonly property string workspaceActionsMode: workspaceDialog.mode
+  readonly property bool workspaceActionsKeyboardReady: workspaceDialog.keyboardReady
+  readonly property var workspaceActionsFocus: workspaceDialog.focusState
   readonly property bool searchFocused: board.searchFocused
   property var overviewScreen: null
   // Docked window-list preference; shell binds this to the saved setting.
@@ -185,7 +188,9 @@ Item {
       }
       MinimapVisibility {
         id: lifecycle
-        initiallyHidden: root.startupHidden
+        // A display added later matches the others: hidden while every strip is
+        // still hidden from a hidden start, otherwise it follows the pin.
+        initiallyHidden: root.startupHidden && root.visibleMinimaps === 0
         pinned: !!root.service && root.service.pinned
         // The workspace action popover keeps its source strip in view; its
         // centered windows and rename panels still suspend the strips.
@@ -209,7 +214,8 @@ Item {
         id: mini
         onCardHitBoxesChanged: cardBoxSync.restart()
         onEnabledChanged: cardBoxSync.restart()
-        Component.onCompleted: cardBoxSync.restart()
+        Component.onCompleted: { cardBoxSync.restart(); Native.Runtime.registerCaptureSurface(mini); }
+        Component.onDestruction: Native.Runtime.unregisterCaptureSurface(mini)
         opacity: lifecycle.revealed ? (root.opacityMode === "entire" ? root.entireOpacity / 100 : 1) : 0
         // Suspension (overview, switcher, workspace editor) must also close the
         // floating list, which would otherwise return open and swallow a click.
@@ -224,6 +230,8 @@ Item {
         captureEnabled: compact.visible
         row: compact.row
         badgeAddresses: root.service ? root.service.stripBadgeAddresses : []
+        urgentAddresses: root.service ? root.service.urgentAddresses : ({})
+        urgentByWorkspace: root.service ? root.service.urgentByWorkspace : ({})
         hitMonitorId: compact.monitorSnapshot ? compact.monitorSnapshot.id : -1
         hitMonitorX: compact.monitorSnapshot ? compact.monitorSnapshot.x : 0
         hitMonitorY: compact.monitorSnapshot ? compact.monitorSnapshot.y : 0
@@ -291,6 +299,8 @@ Item {
       OverviewBoard {
         id: board
         anchors.fill: parent
+        Component.onCompleted: Native.Runtime.registerCaptureSurface(board)
+        Component.onDestruction: Native.Runtime.unregisterCaptureSurface(board)
         listEnabled: root.windowListEnabled
         density: root.density
         onListToggleRequested: function(value) { root.windowListToggleRequested(value); }
@@ -303,6 +313,7 @@ Item {
         scopeWorkspace: root.scopeWorkspace
         focusedAddress: root.service ? root.service.focusedAddress : ""
         badgeAddresses: root.service ? root.service.stripBadgeAddresses : []
+        urgentAddresses: root.service ? root.service.urgentAddresses : ({})
         captureEnabled: overview.visible && !root.suppressed
         iconFor: Native.Runtime.iconFor
         nameFor: Native.Runtime.nameFor

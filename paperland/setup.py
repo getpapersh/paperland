@@ -2,7 +2,7 @@
 """Install Paperland and explicitly configure user-owned Hyprland files."""
 
 import argparse
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 import difflib
 import fcntl
 import hashlib
@@ -21,15 +21,20 @@ INSTALL_MARKER = "Paperland CLI installation v1\n"
 CONFIG_HEADER = "-- Paperland setup (generated; edit with paperland setup)\n"
 BEGIN = "-- BEGIN Paperland setup\n"
 END = "-- END Paperland setup\n"
-OWNED = "hypr/paperland.lua"
+# Generated files live under $XDG_STATE_HOME/paperland/hypr, never in the user's (possibly
+# dotfile-symlinked) Hyprland directory, and survive install, which replaces the data folder.
+GENERATED = "paperland/hypr"
+OWNED = "paperland.lua"
+NAMES = "paperland-workspace-names.lua"
+DESKTOP_DIRECTIONS = "paperland-desktop-directions.lua"
+FORMER = (OWNED, NAMES, DESKTOP_DIRECTIONS)  # same names under <config>/hypr before the move
 LEGACY = "hypr/paperland-setup.lua"
-NAMES = "hypr/paperland-workspace-names.lua"
-DESKTOP_DIRECTIONS = "hypr/paperland-desktop-directions.lua"
 DESKTOP_HEADER = "-- Paperland Desktop directions (generated; edit with paperland setup)\n"
 MODULES = {
     "preview_control": "native/preview-control.lua",
     "centering": "lua/canvas-actions.lua",
     "strip_focus": "lua/strip-focus.lua",
+    "strip_columns": "lua/strip-columns.lua",
     "monitor_direction": "lua/monitor-direction.lua",
 }
 STRIP_CHORD = "SUPER + CTRL"
@@ -109,6 +114,17 @@ def build_input_bridge(source, staging):
         print(f"Paperland input bridge unavailable: {error}", file=sys.stderr)
 
 
+def peek(path):
+    """Bytes of a file we only inspect, even behind a dotfile symlink; None when absent."""
+    if path.exists() and not path.is_file():
+        raise SetupError(f"Expected a regular file: {path}")
+    return path.read_bytes() if path.is_file() else None
+
+
+def behind_symlink(path):
+    return any(p.is_symlink() for p in [path, *path.parents])
+
+
 def regular(path):
     # Replacing a dotfile symlink would break the user's config composition.
     if any(p.is_symlink() for p in [path, *path.parents]):
@@ -180,7 +196,7 @@ def install(no_setup):
 
 
 def install_files():
-    home, _, data, _ = paths()
+    home, _, data, state = paths()
     source = Path(__file__).resolve().parent
     destination = data / "paperland"
     launcher = home / ".local/bin/paperland"
@@ -227,6 +243,8 @@ def install_files():
     finally:
         if staging.exists():
             shutil.rmtree(staging)
+    # The names writer saves here before any setup run; the directory survives later installs.
+    (state / GENERATED).mkdir(parents=True, exist_ok=True)
     print(f"Installed Paperland: {destination}\nLauncher: {launcher}")
     if previous:
         print(f"Previous installation retained: {previous}")
@@ -240,7 +258,8 @@ def uninstall():
     launcher = home / ".local/bin/paperland"
     plugin = config / "omarchy/plugins/json.paperland"
     shell = config / "omarchy/shell.json"
-    owned = config / OWNED
+    owned = state / GENERATED / OWNED
+    former_owned = config / "hypr" / OWNED
     main = config / "hypr/hyprland.lua"
     marker = destination / ".installed-by-paperland"
     if destination.is_symlink() or not marker.is_file() or marker.read_text() != INSTALL_MARKER:
@@ -253,10 +272,11 @@ def uninstall():
         bar = shell.read_text(errors="replace")
         if "json.paperland" in bar and (str(launcher) in bar or str(destination / "paperland") in bar):
             raise SetupError(f"Omarchy bar still references this installation; review {shell} before uninstall")
-    before_owned = regular(owned)
-    if before_owned is None:
+    new_owned = regular(owned)
+    old_owned = peek(former_owned)
+    main_text = main.read_text(errors="replace") if main.is_file() else ""
+    if new_owned is None and old_owned is None:
         # A files-only install has no desktop contribution to detach.
-        main_text = main.read_text(errors="replace") if main.is_file() else ""
         if BEGIN in main_text or str(owned) in main_text or str(destination) in main_text:
             raise SetupError(f"Hyprland still references Paperland; runtime retained: {main}")
         launcher.unlink()
@@ -265,33 +285,87 @@ def uninstall():
         destination.rename(retained)
         print(f"Uninstalled Paperland. Runtime retained for review: {retained}\nSettings and backups retained: {state / 'paperland'}")
         return
-    before_main = regular(main)
-    if before_main is None:
+    if not main.is_file():
         raise SetupError("Main Hyprland config is missing; runtime retained")
     try:
-        old = before_owned.decode()
-        generated_options(before_owned, str(config / NAMES))
+        for before, names in ((new_owned, str(state / GENERATED / NAMES)), (old_owned, str(config / "hypr" / NAMES))):
+            if before is not None:
+                generated_options(before, names)
     except (ValueError, KeyError, IndexError, TypeError, SetupError):
         raise SetupError(f"Generated setup was edited; runtime retained: {owned}")
-    include = BEGIN + f"dofile({lua(str(owned))})\n" + END
+    includes = [BEGIN + f"dofile({lua(str(path))})\n" + END for path in (owned, former_owned)]
+    before_main = main.read_bytes()
     original = before_main.decode()
-    if original.count(include) != 1 or original.count(BEGIN) != 1 or original.count(END) != 1:
+    present = [block for block in includes if original.count(block) == 1]
+    if BEGIN in original and (len(present) != 1 or original.count(BEGIN) != 1 or original.count(END) != 1):
         raise SetupError(f"Paperland include was edited or is absent; runtime retained: {main}")
-    revision = re.search(r'_G.paperland_setup_revision = "([a-f0-9]+)"', old).group(1)
-    if run(["hyprctl", "repl", "return _G.paperland_setup_revision"]) != revision:
-        raise SetupError("Active Hyprland config does not match this installation; runtime retained")
-    after_main = original.replace(include, "", 1).encode()
-    if str(owned) in after_main.decode() or str(destination / MODULES["monitor_direction"]) in after_main.decode():
-        raise SetupError("Another reference to Paperland setup remains; runtime retained")
-    apply_changes({main: (before_main, after_main)}, None, data, state, None, reload=True)
-    if regular(owned) != before_owned or regular(main) != after_main:
-        raise SetupError("Config changed after detach; runtime retained for inspection")
-    owned.unlink()
+    after_main = original.replace(present[0], "", 1) if present else original
+    for text in (str(owned), str(former_owned), str(destination / MODULES["monitor_direction"])):
+        if text in after_main:
+            raise SetupError("Another reference to Paperland setup remains; runtime retained")
+    if present and behind_symlink(main):
+        # Setup never edits through a dotfile symlink: the user removes the block, then reruns.
+        raise SetupError(f"Symlinked Hyprland config needs a manual edit; runtime and generated files retained.\n"
+                         f"Remove these exact lines from {main}:\n{present[0]}Then rerun uninstall.")
+    changes = {}
+    if present:
+        revision_file = new_owned if new_owned is not None and present[0] == includes[0] else old_owned
+        revision = re.search(r'_G.paperland_setup_revision = "([a-f0-9]+)"', revision_file.decode()).group(1)
+        if run(["hyprctl", "repl", "return _G.paperland_setup_revision"]) != revision:
+            raise SetupError("Active Hyprland config does not match this installation; runtime retained")
+        changes[main] = (before_main, after_main.encode())
+    left = []
+    for path in (owned, state / GENERATED / DESKTOP_DIRECTIONS, former_owned,
+                 config / "hypr" / DESKTOP_DIRECTIONS, config / LEGACY):
+        before = peek(path)
+        if before is None:
+            continue
+        if behind_symlink(path):
+            left.append(path)
+        else:
+            changes[path] = (before, None)
+    if changes:
+        apply_changes(changes, None, data, state, None, None, reload=main in changes, locked=False)
     launcher.unlink()
     retained = Path(tempfile.mkdtemp(prefix=".paperland-uninstalled-", dir=data))
     retained.rmdir()
     destination.rename(retained)
     print(f"Uninstalled Paperland. Runtime retained for review: {retained}\nSettings and backups retained: {state / 'paperland'}")
+    for path in left:
+        print(f"Left in place behind a symlink; remove it yourself if unwanted: {path}")
+    kept = state / GENERATED / NAMES
+    if kept.exists():
+        print(f"Saved workspace names kept: {kept}")
+
+
+NAME_RULE = re.compile(r'^hl\.workspace_rule\(\{ workspace = "([1-9][0-9]*)", default_name = ("(?:[^"\\]|\\["\\])*") \}\)$')
+
+
+def names_rows(data, path):
+    lines = data.decode(errors="replace").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    rows = {}
+    for line in lines[1:]:
+        match = NAME_RULE.match(line)
+        if not match or match.group(1) in rows:
+            raise SetupError(f"Cannot merge saved workspace names: {path} is not in Paperland's format; "
+                             "fix or remove it, then rerun setup")
+        rows[match.group(1)] = line
+    return (lines[0] if lines else ""), rows
+
+
+def merge_names(old, new, old_path, new_path):
+    """Union of both names files. The newer file wins a conflict, so a rename made after
+    the files diverged survives; a name only the old file has is never dropped."""
+    if new is None or new == b"" or new == old:
+        return old if not new else new
+    old_header, old_rows = names_rows(old, old_path)
+    new_header, new_rows = names_rows(new, new_path)
+    if old_header != new_header:
+        raise SetupError(f"Cannot merge saved workspace names: {old_path} and {new_path} have different headers")
+    rows = {**new_rows, **old_rows} if old_path.stat().st_mtime > new_path.stat().st_mtime else {**old_rows, **new_rows}
+    return (new_header + "\n" + "".join(rows[key] + "\n" for key in sorted(rows, key=int))).encode()
 
 
 def lua(value):
@@ -308,8 +382,8 @@ def desktop_record(values):
                                      sorted(values.items(), key=lambda item: int(item[0]))) + "}\n").encode()
 
 
-def read_desktop_record(path):
-    before = regular(path)
+def read_desktop_record(path, inspect=False):
+    before = peek(path) if inspect else regular(path)
     if before is None:
         return None, {}
     try:
@@ -443,6 +517,10 @@ end
         content += (f'\n_G.paperland_strip_chord = {lua(STRIP_CHORD)}\n'
                     f'_G.paperland_strip_launcher = {lua(options["launcher"])}\n'
                     f'dofile({lua(module)})\n')
+    if options.get("strip_columns"):
+        module = str(Path(options["launcher"]).parent / MODULES["strip_columns"])
+        content += (f'\n_G.paperland_columns_launcher = {lua(options["launcher"])}\n'
+                    f'dofile({lua(module)})\n')
     if options.get("monitor_direction") is True:
         module = str(Path(options["launcher"]).parent / MODULES["monitor_direction"])
         content += (f'\n_G.paperland_monitor_direction_options = '
@@ -475,6 +553,8 @@ def module_hashes(options, launcher):
         loaded["centering"] = MODULES["centering"]
     if options.get("strip_chord") == STRIP_CHORD:
         loaded["strip_focus"] = MODULES["strip_focus"]
+    if options.get("strip_columns"):
+        loaded["strip_columns"] = MODULES["strip_columns"]
     if options.get("monitor_direction") is True:
         loaded["monitor_direction"] = MODULES["monitor_direction"]
     digests = {}
@@ -497,8 +577,9 @@ def changed_modules(options, launcher):
 def report_changed_modules(launcher):
     """Warn at install time too: the generated dofile picks up a replaced module
     on the next compositor reload, before any later setup run could report it."""
-    _, config, data, _ = paths()
-    owned = config / OWNED if (config / OWNED).exists() else config / LEGACY
+    _, config, data, state = paths()
+    owned = next((p for p in (state / GENERATED / OWNED, config / "hypr" / OWNED, config / LEGACY)
+                  if p.exists()), config / LEGACY)
     try:
         options = json.loads(owned.read_text().splitlines()[1].removeprefix("-- options: "))
         # launcher is the ~/.local/bin symlink; modules live beside the runtime.
@@ -624,7 +705,66 @@ def direction_conflicts(main, skip):
     return found
 
 
-def bar_change(config, data, launcher, mode, scratchpad):
+PILL_DEFAULTS = {
+    "showId": True, "showCount": True, "showName": True, "showIcons": True,
+    "showFocusedTitle": False, "iconsOn": "active", "maxIcons": 4,
+    "groupByApp": False, "iconStyle": "color",
+}
+PILL_ENUMS = {"iconsOn": ("all", "active", "hover"), "iconStyle": ("color", "mono")}
+
+
+def pill_value(key, value):
+    """The value the bar would use: invalid persisted values fall back per field."""
+    default = PILL_DEFAULTS[key]
+    if key in PILL_ENUMS:
+        return value if value in PILL_ENUMS[key] else default
+    if key == "maxIcons":
+        # The bar's JS reader accepts any finite integral number, 6.0 included.
+        integral = type(value) in (int, float) and value == value and abs(value) != float("inf") \
+            and value == int(value)
+        return max(1, min(8, int(value))) if integral else default
+    return value if type(value) is bool else default
+
+
+def pill_selection(text):
+    """Validated workspace-pill edits for the json.paperland module entry."""
+    if text is None:
+        return None
+    try:
+        selected = json.loads(text)
+    except (ValueError, TypeError):
+        raise SetupError("Workspace pill preferences must be a JSON object")
+    if not isinstance(selected, dict) or not selected:
+        raise SetupError("Workspace pill preferences must be a non-empty JSON object")
+    for key, value in selected.items():
+        if key not in PILL_DEFAULTS or pill_value(key, value) != value or type(value) is not type(PILL_DEFAULTS[key]):
+            raise SetupError(f"Invalid workspace pill preference: {key}")
+    return selected
+
+
+def bar_item_present(config):
+    """Whether shell.json has a json.paperland item; None when it cannot be read.
+    Read-only, so it follows a tracked dotfile symlink that bar_change refuses
+    to write through."""
+    shell_path = config / "omarchy/shell.json"
+    try:
+        if not shell_path.exists():
+            # A dangling tracked symlink exists as a link but cannot be read:
+            # unknowable, so keep the previous choice instead of removing the
+            # reporter. A genuinely absent file means no bar item.
+            return None if shell_path.is_symlink() else False
+        layout = json.loads(shell_path.read_bytes())["bar"]["layout"]
+        return any(isinstance(widget, dict) and widget.get("id") == "json.paperland"
+                   for section in ("left", "center", "right") for widget in layout[section])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def bar_selected(args):
+    return args.omarchy_bar != "keep" or args.omarchy_bar_scratchpad != "keep" or args.omarchy_bar_pills is not None
+
+
+def bar_change(config, data, launcher, mode, scratchpad, pills=None):
     shell_path = config / "omarchy/shell.json"
     if mode == "enable":
         action = (f'add or update a json.paperland item with executable {json.dumps(str(launcher))}'
@@ -633,7 +773,12 @@ def bar_change(config, data, launcher, mode, scratchpad):
     elif mode == "disable":
         action = "remove the owned json.paperland item and restore omarchy.workspaces at its position only if none exists"
     else:
-        action = f'set json.paperland scratchpad to {str(scratchpad == "show").lower()} and preserve all other settings'
+        action = "set json.paperland " + ", ".join(
+            ([f'scratchpad to {str(scratchpad == "show").lower()}'] if scratchpad != "keep" else [])
+            + [f"{key} to {json.dumps(value)}" for key, value in sorted((pills or {}).items())]
+        ) + " and preserve all other settings"
+    if mode == "enable" and pills:
+        action += "; set " + ", ".join(f"{key} to {json.dumps(value)}" for key, value in sorted(pills.items()))
     try:
         before = regular(shell_path)
     except SetupError as error:
@@ -661,10 +806,13 @@ def bar_change(config, data, launcher, mode, scratchpad):
             raise ValueError("Existing json.paperland item has an unowned executable")
         if existing and mode == "disable" and existing.get("executable") is None and not plugin_owned:
             raise ValueError("Existing json.paperland item has no installer-owned executable")
-        if mode == "enable" or scratchpad != "keep":
+        if mode != "disable" and pills and not existing and mode != "enable":
+            raise ValueError("Workspace pill preferences need an enabled json.paperland item")
+        if mode == "enable" or scratchpad != "keep" or pills:
             item = {**(existing or {}), "id": "json.paperland", "executable": str(launcher)}
             if scratchpad != "keep":
                 item["scratchpad"] = scratchpad == "show"
+            item.update(pills or {})
         else:
             item = None
         workspace_exists = any((widget.get("id") if isinstance(widget, dict) else widget) == "omarchy.workspaces"
@@ -748,9 +896,12 @@ def show_diff(changes):
 
 
 
-# SettingsRegistry.js is the one list of runtime preferences; config.py reads it the same way.
-RUNTIME_KEYS = json.loads(re.search(r"// BEGIN registry\s*var KEYS = (\{.*?\});\s*// END registry",
-                                    (Path(__file__).resolve().parent / "SettingsRegistry.js").read_text(), re.S).group(1))
+# SettingsRegistry.js is the one list of runtime preferences; shared/settings_ini.py is the one writer.
+sys.dont_write_bytecode = True  # shared/ is hashed into the build identity
+sys.path.insert(0, str(Path(__file__).resolve().parent / "shared"))
+import settings_ini  # noqa: E402
+
+RUNTIME_KEYS = settings_ini.KEYS
 RUNTIME_DEFAULTS = {key: spec["default"] for key, spec in RUNTIME_KEYS.items()}
 
 
@@ -780,6 +931,10 @@ def runtime_values(before):
                 except ValueError:
                     raise SetupError(f"Invalid saved runtime preference: {key}")
             else:
+                if value not in RUNTIME_KEYS[key]["values"]:
+                    raise SetupError(f"Invalid saved runtime preference: {key}={value}. "
+                                     f"Run `paperland config unset {key}` or set it to one of: "
+                                     + ", ".join(RUNTIME_KEYS[key]["values"]))
                 values[key] = value
     return values
 
@@ -798,37 +953,23 @@ def runtime_change(before, selection, baseline):
             raise SetupError(f"Invalid runtime preference: {key}")
         if key in limits and not limits[key][0] <= value <= limits[key][1]:
             raise SetupError(f"Runtime preference out of range: {key}")
-        if key == "minimapOpacityMode" and value not in ("background", "entire"):
-            raise SetupError("Invalid minimap opacity mode")
+        if RUNTIME_KEYS[key]["type"] == "choice" and value not in RUNTIME_KEYS[key]["values"]:
+            raise SetupError(f"Invalid value for runtime preference: {key}")
         if type(expected[key]) is not type(RUNTIME_DEFAULTS[key]) or current[key] != expected[key]:
             raise SetupError("Runtime preferences changed while editing; reopen Settings before saving")
     if {**current, **selected}["pinned"] and {**current, **selected}["peek"]:
         raise SetupError("Pinned and Peek cannot both be enabled")
-    remaining = dict(selected)
-    lines, general = [], False
-    for line in (before or b"").decode().splitlines(True):
-        if line.startswith("["):
-            if general:
-                lines.extend(f"{key}={str(value).lower()}\n" for key, value in sorted(remaining.items()))
-                remaining.clear()
-            general = line.strip() == "[General]"
-        key = line.partition("=")[0]
-        if general and key in remaining:
-            line = f"{key}={str(remaining.pop(key)).lower()}\n"
-        lines.append(line)
-    if not general and remaining:
-        if lines and not lines[-1].endswith("\n"):
-            lines[-1] += "\n"
-        lines.append("\n[General]\n")
-    elif remaining and lines and not lines[-1].endswith("\n"):
-        lines[-1] += "\n"
-    lines.extend(f"{key}={str(value).lower()}\n" for key, value in sorted(remaining.items()))
-    return "".join(lines).encode()
+    try:
+        return settings_ini.render((before or b"").decode(), dict(sorted(selected.items()))).encode()
+    except settings_ini.Failure as error:
+        raise SetupError(str(error))
 
 
 def settings_dependencies(config, data, launcher):
     """Fingerprint every input the reviewed generated configuration can read."""
-    files = [config / name for name in (OWNED, LEGACY, NAMES, DESKTOP_DIRECTIONS, "hypr/hyprland.lua",
+    files = [paths()[3] / GENERATED / name for name in (OWNED, NAMES, DESKTOP_DIRECTIONS)]
+    files += [config / "hypr" / name for name in FORMER]
+    files += [config / name for name in (LEGACY, "hypr/hyprland.lua",
                                            "omarchy/shell.json", "omarchy/plugins/json.paperland")]
     files += [launcher.parent / name for name in MODULES.values()]
     files += [launcher.parent / name for name in ("native/MinimapInput.so", "native/MinimapInput.version")]
@@ -861,7 +1002,7 @@ def settings_plan(args, changes, plugin_link, config, data, launcher, options, w
     selection = {name: getattr(args, name) for name in ("shortcut", "resize", "autostart",
         "centering", "strip_chord", "bar_panels", "omarchy_bar", "monitor_direction",
         "omarchy_bar_scratchpad", "monitor_direction_override", "desktop_direction", "replace_bindings",
-        "runtime_preferences", "runtime_baseline", "minimap_blur")}
+        "runtime_preferences", "runtime_baseline", "minimap_blur", "omarchy_bar_pills")}
     bar_path = config / "omarchy/shell.json"
     bar_after = changes.get(bar_path, (None, None))[1]
     if bar_after is None:
@@ -870,7 +1011,7 @@ def settings_plan(args, changes, plugin_link, config, data, launcher, options, w
         except SetupError:
             # Read a linked target for display only; bar_change still refuses writes.
             bar_after = bar_path.read_bytes() if bar_path.is_file() else None
-    bar_effective = bar_scratchpad = None
+    bar_effective = bar_scratchpad = bar_pills = None
     if bar_after is not None:
         try:
             layout = json.loads(bar_after)["bar"]["layout"]
@@ -878,6 +1019,9 @@ def settings_plan(args, changes, plugin_link, config, data, launcher, options, w
                          if isinstance(widget, dict) and widget.get("id") == "json.paperland"), None)
             bar_effective = item is not None
             bar_scratchpad = item.get("scratchpad", True) if item else None
+            # What the bar renders: each invalid stored value uses its default.
+            bar_pills = {key: pill_value(key, item.get(key, default))
+                         for key, default in PILL_DEFAULTS.items()} if item else None
         except (ValueError, KeyError, TypeError):
             pass
     identity = {"selection": selection, "dependencies": dependencies,
@@ -904,14 +1048,16 @@ def settings_plan(args, changes, plugin_link, config, data, launcher, options, w
         effective["compositor_blur"] = json.loads(run(["hyprctl", "getoption", "decoration:blur:enabled", "-j"]))["bool"]
     except (SetupError, ValueError, KeyError):
         effective["compositor_blur"] = None
-    effective.update(omarchy_bar=bar_effective, bar_scratchpad=bar_scratchpad,
+    effective.update(omarchy_bar=bar_effective, bar_scratchpad=bar_scratchpad, bar_pills=bar_pills,
                      bar_available=bar_path.is_file(), desktop_directions=desktop_choices,
                      active_desktop_directions=active_desktops,
                      native_direction_available=direction_available)
     return {"token": token, "files": files, "warnings": warnings,
             "effective": effective,
             "staged": {"omarchy_bar": args.omarchy_bar,
-                       "bar_scratchpad": args.omarchy_bar_scratchpad},
+                       "bar_scratchpad": args.omarchy_bar_scratchpad,
+                       **({"bar_pills": pill_selection(args.omarchy_bar_pills)}
+                          if args.omarchy_bar_pills is not None else {})},
             "plugin_link": str(plugin_link) if plugin_link else None,
             "manual": manual,
             "next_action": manual or (("omarchy-shell shell rescanPlugins" if plugin_link else "omarchy-shell shell reloadConfig")
@@ -1028,7 +1174,12 @@ def apply_changes(changes, plugin_link, data, state, expected_revision, verify=N
     # for a reload explicitly. Preference and Bar saves touch files it never reads.
     if reload is None:
         reload = expected_revision is not None or confirm is not None
-    with lock:
+    # The shell's writer takes the same lock, so no shell write lands between the stale check and
+    # the write, or between a failed apply and its restore.
+    with lock, ExitStack() as writers:
+        for path in changes:
+            if path.name == "settings.ini":
+                writers.enter_context(settings_ini.locked(path))
         if verify:
             verify()
         for path, (before, _) in changes.items():
@@ -1199,7 +1350,7 @@ def _run_setup(args, activate_default=False):
     interactive = not activate_default and not any((args.apply, args.dry_run, args.print_config,
         args.settings_preview, args.settings_apply, args.shortcut != "keep", args.resize != "keep",
         args.autostart != "keep", args.centering != "keep", args.strip_chord != "keep",
-        args.bar_panels != "keep", args.omarchy_bar != "keep", args.omarchy_bar_scratchpad != "keep",
+        args.bar_panels != "keep", bar_selected(args),
         args.monitor_direction != "keep",
         args.monitor_direction_override, args.desktop_direction, args.runtime_preferences, args.minimap_blur != "keep"))
     if interactive:
@@ -1210,19 +1361,29 @@ def _run_setup(args, activate_default=False):
     marker = data / "paperland/.installed-by-paperland"
     if not launcher.is_file() or not marker.is_file() or marker.read_text() != INSTALL_MARKER:
         raise SetupError("Run paperland install --no-setup first")
-    owned = config / OWNED
+    owned = state / GENERATED / OWNED
+    names_path = state / GENERATED / NAMES
+    names = str(names_path)
+    desktop_path = state / GENERATED / DESKTOP_DIRECTIONS
     legacy = config / LEGACY
-    names = str(config / NAMES)
-    desktop_path = config / DESKTOP_DIRECTIONS
+    former = {name: config / "hypr" / name for name in FORMER}
     main = config / "hypr/hyprland.lua"
     before_owned = regular(owned)
-    before_legacy = regular(legacy)
+    # Files from before the move are inspected even behind a dotfile symlink, never written there.
+    before_legacy = peek(legacy)
+    before_former = {name: peek(path) for name, path in former.items()}
     before_desktop, saved_desktops = read_desktop_record(desktop_path)
+    migrating_desktops = False
+    if before_desktop is None and before_former[DESKTOP_DIRECTIONS] is not None and before_former[OWNED] is not None:
+        _, saved_desktops = read_desktop_record(former[DESKTOP_DIRECTIONS], inspect=True)
+        migrating_desktops = bool(saved_desktops)
     desktop_choices = dict(saved_desktops)
     options = {"shortcut": "none", "resize": "system", "autostart": "off", "launcher": str(launcher)}
     previous = None
     # A recognized legacy file is migrated: its choices carry over and it is retired.
-    for path, before, loads_names in ((legacy, before_legacy, None), (owned, before_owned, names)):
+    for path, before, loads_names in ((legacy, before_legacy, None),
+                                      (former[OWNED], before_former[OWNED], str(former[NAMES])),
+                                      (owned, before_owned, names)):
         if before is not None:
             try:
                 previous = generated_options(before, loads_names)
@@ -1234,6 +1395,8 @@ def _run_setup(args, activate_default=False):
     previous_options = options.copy()
     if args.minimap_blur != "keep":
         options["minimap_blur"] = args.minimap_blur == "on"
+    if options.get("desktop_direction_record") == str(former[DESKTOP_DIRECTIONS]):
+        options["desktop_direction_record"] = str(desktop_path)
     if options.get("desktop_direction_record", str(desktop_path)) != str(desktop_path):
         raise SetupError(f"Generated Desktop direction record path is not owned by Paperland: {owned}")
     if activate_default and "monitor_direction" not in options:
@@ -1249,7 +1412,7 @@ def _run_setup(args, activate_default=False):
             desktop_choices.pop(number, None)
         else:
             desktop_choices[number] = value
-    if desktop_choices != saved_desktops:
+    if desktop_choices != saved_desktops or migrating_desktops:
         options["desktop_direction_record"] = str(desktop_path)
     refuse_unsafe_retirement(previous_options.get("monitor_direction"), saved_desktops,
                              desktop_choices, options.get("monitor_direction"))
@@ -1278,6 +1441,24 @@ def _run_setup(args, activate_default=False):
             options["strip_chord"] = args.strip_chord
     if args.bar_panels != "keep":
         options["bar_panels"] = args.bar_panels
+    # The bar's column reporter loads whenever Paperland's bar item is (or is
+    # being) enabled, independently of the chord. Absent otherwise, so a config
+    # without bar integration renders byte-identical; unreadable bar config
+    # keeps the previous choice.
+    bar_on = {"enable": True, "disable": False}.get(args.omarchy_bar) if args.omarchy_bar != "keep" \
+        else bar_item_present(config)
+    if activate_default and args.omarchy_bar == "keep":
+        # Install never adds generated modules silently: keep the reviewed
+        # choice and point to the setup run that previews the addition.
+        if bar_on and not options.get("strip_columns"):
+            print("Paperland's bar item can load the workspace pill column reporter "
+                  f"({MODULES['strip_columns']}). Rerun setup to refresh the generated config.\n"
+                  f"Review with: {shlex.quote(str(launcher))} setup --dry-run")
+        bar_on = None
+    if bar_on:
+        options["strip_columns"] = True
+    elif bar_on is False:
+        options.pop("strip_columns", None)
     # Retained chords were saved before canonicalization existed; normalize them
     # too, or a saved code:021 slips past the spelling-based conflict checks.
     for name in ("shortcut", "centering"):
@@ -1329,7 +1510,7 @@ def _run_setup(args, activate_default=False):
                              if name in recorded_modules and recorded_modules[name] != digest)
     generated = render(options, names).encode()
     if args.print_config:
-        if args.omarchy_bar != "keep" or args.omarchy_bar_scratchpad != "keep":
+        if bar_selected(args):
             raise SetupError("--print-config exports Lua only; use --dry-run to preview Omarchy Bar changes")
         print(generated.decode(), end="")
         return
@@ -1340,7 +1521,7 @@ def _run_setup(args, activate_default=False):
         runtime_path = state / "paperland/settings.ini"
         before_runtime = regular(runtime_path)
         changes[runtime_path] = (before_runtime, runtime_change(before_runtime, args.runtime_preferences, args.runtime_baseline))
-    if desktop_choices != saved_desktops:
+    if desktop_choices != saved_desktops or migrating_desktops:
         changes[desktop_path] = (before_desktop, desktop_record(desktop_choices))
     include_added = False
     manual = None
@@ -1349,7 +1530,8 @@ def _run_setup(args, activate_default=False):
     if (previous is not None or options["shortcut"] != "none" or options["resize"] != "system"
             or options["autostart"] != "off" or options.get("preview_control", False)
             or options.get("centering", "none") != "none" or strip_chord == STRIP_CHORD
-            or "monitor_direction" in options or "minimap_blur" in options):
+            or "monitor_direction" in options or "minimap_blur" in options
+            or options.get("strip_columns", False)):
         # A tracked symlink is safe to inspect when its marked include is already present.
         before_main = main.read_bytes() if main.is_file() else None
         if before_main is None:
@@ -1360,7 +1542,8 @@ def _run_setup(args, activate_default=False):
             raise SetupError(f"Invalid Paperland include markers in {main}")
         if BEGIN in original:
             start, end = original.index(BEGIN), original.index(END) + len(END)
-            if original[start:end] not in (include, BEGIN + f"dofile({lua(str(legacy))})\n" + END):
+            if original[start:end] not in (include, BEGIN + f"dofile({lua(str(former[OWNED]))})\n" + END,
+                                           BEGIN + f"dofile({lua(str(legacy))})\n" + END):
                 raise SetupError(f"Paperland include was edited in {main}; review it manually")
             updated_main = original[:start] + include + original[end:]
             edit = "Replace the Paperland block in its tracked target with these exact lines"
@@ -1369,11 +1552,17 @@ def _run_setup(args, activate_default=False):
             edit = "Add these exact lines to its tracked target"
         include_added = BEGIN not in original
         # paperland.lua loads the names file; a standalone include would load it twice.
-        own_names = {f"dofile({lua(names)})"}
-        if Path(names) == Path.home() / ".config" / NAMES:
-            own_names.add(f'dofile(os.getenv("HOME") .. {lua("/.config/" + NAMES)})')
+        own_names = {f"dofile({lua(names)})", f"dofile({lua(str(former[NAMES]))})"}
+        if former[NAMES] == Path.home() / ".config/hypr" / NAMES:
+            own_names.add(f'dofile(os.getenv("HOME") .. {lua("/.config/hypr/" + NAMES)})')
         leftovers = [(number, line.strip()) for number, line in enumerate(original.splitlines(), 1)
-                     if NAMES.split("/")[-1] in line and not line.lstrip().startswith("--")]
+                     if NAMES in line and not line.lstrip().startswith("--")]
+        retiring = [(path, before_former[name]) for name, path in former.items()
+                    if before_former[name] is not None and not behind_symlink(path)]
+        if before_legacy is not None and not behind_symlink(legacy):
+            retiring.append((legacy, before_legacy))
+        stuck = [path for name, path in former.items() if before_former[name] is not None and behind_symlink(path)]
+        moved = bool(retiring) or any(before is not None for before in before_former.values())
         symlinked = any(part.is_symlink() for part in [main, *main.parents])
         removals = "".join(f"\nRemove {main}:{number}: {text}" for number, text in leftovers)
         if symlinked and updated_main != original:
@@ -1381,7 +1570,8 @@ def _run_setup(args, activate_default=False):
             # Setup never edits through a dotfile symlink. It stages paperland.lua through the
             # normal consent and locked apply, unloaded, so the block is valid once pasted.
             manual = (f"Symlinked main config needs a manual include.\n{edit}:\n{include}{removals}\n"
-                      "Then rerun setup" + (f" to retire {legacy}." if before_legacy is not None else " to validate it."))
+                      "Then rerun setup" + (" to retire the old generated files."
+                                            if moved or before_legacy is not None else " to validate it."))
             changes[owned] = (before_owned, generated)
         elif leftovers and (symlinked or any(text not in own_names for _, text in leftovers)):
             raise SetupError(("Symlinked main config needs a manual edit." if symlinked
@@ -1390,12 +1580,27 @@ def _run_setup(args, activate_default=False):
             updated_main = "".join(line for line in updated_main.splitlines(True) if line.strip() not in own_names)
             changes[owned] = (before_owned, generated)
             changes[main] = (before_main, updated_main.encode())
-            if before_legacy is not None:
-                changes[legacy] = (before_legacy, None)
+            # Saved names move only with the active include, so until the user pastes the block
+            # the UI keeps using the old file (see the launcher) and nothing is lost by waiting.
+            if before_former[NAMES] is not None:
+                before_names = regular(names_path)
+                merged = merge_names(before_former[NAMES], before_names, former[NAMES], names_path)
+                if merged != before_names:
+                    changes[names_path] = (before_names, merged)
+            for path, before in retiring:
+                changes[path] = (before, None)
+            if stuck and not args.settings_preview:
+                print("Old generated files sit behind a symlink and are never deleted; remove them yourself: "
+                      + ", ".join(map(str, stuck)), file=sys.stderr)
+            if before_former[NAMES] is not None and not args.settings_preview:
+                print("Saved names moved; restart Paperland so its name editor uses the new file.", file=sys.stderr)
     plugin_link = None
-    if args.omarchy_bar != "keep" or args.omarchy_bar_scratchpad != "keep":
+    pills = pill_selection(args.omarchy_bar_pills)
+    if pills and args.omarchy_bar == "disable":
+        raise SetupError("Workspace pill preferences cannot be saved while the bar item is being disabled")
+    if bar_selected(args):
         path, before, after, plugin_link, bar_manual = bar_change(
-            config, data, launcher, args.omarchy_bar, args.omarchy_bar_scratchpad)
+            config, data, launcher, args.omarchy_bar, args.omarchy_bar_scratchpad, pills)
         if before is not None or after is not None:
             changes[path] = (before, after)
         if bar_manual:
@@ -1403,7 +1608,7 @@ def _run_setup(args, activate_default=False):
     changes = {path: change for path, change in changes.items() if change[0] != change[1]}
     warnings = []
     if options.get("monitor_direction") is True:
-        for path, line in direction_conflicts(main, (owned, legacy)):
+        for path, line in direction_conflicts(main, (owned, legacy, former[OWNED])):
             warning = f"Possible workspace direction rule at {path}:{line}; Paperland remains enabled."
             warnings.append(warning)
             if not args.settings_preview:
@@ -1411,7 +1616,7 @@ def _run_setup(args, activate_default=False):
         if not previous_options.get("monitor_direction") and (args.apply or args.settings_apply or interactive):
             check_monitor_direction_capability()
     expected_revision = None
-    if not manual_include and (owned in changes or main in changes or legacy in changes):
+    if not manual_include and (changes.keys() & {owned, main, legacy, *former.values()}):
         expected_revision = re.search(r'_G.paperland_setup_revision = "([a-f0-9]+)"', generated.decode()).group(1)
     native_choices = {}
     if not manual_include and options.get("monitor_direction"):
@@ -1486,6 +1691,7 @@ def _run_setup(args, activate_default=False):
           f"Centering toggle: {options.get('centering', 'none')}\n"
           f"Strip focus chord: {strip_chord or 'none'}\n"
           f"Bar panel shortcuts: {bar_panels}\nOmarchy bar: {args.omarchy_bar}\n"
+          f"Bar column reporter ({MODULES['strip_columns']}): {'on' if options.get('strip_columns') else 'off'}\n"
           f"Monitor direction: {'on' if options.get('monitor_direction') else 'off'}")
     if strip_chord == STRIP_CHORD:
         for digit in range(1, 10):
@@ -1516,7 +1722,7 @@ def _run_setup(args, activate_default=False):
         if manual:
             raise SetupError(manual_preview)
         return
-    if interactive and (args.omarchy_bar != "keep" or args.omarchy_bar_scratchpad != "keep"):
+    if interactive and bar_selected(args):
         print("Exact Omarchy Bar changes to review:")
         show_diff(changes)
     if interactive:
@@ -1580,6 +1786,8 @@ def parser():
     setup.add_argument("--omarchy-bar", choices=["keep", "enable", "disable"], default="keep")
     setup.add_argument("--omarchy-bar-scratchpad", choices=["keep", "show", "hide"], default="keep",
                        help="Show or hide Paperland's Omarchy Bar Scratchpad pill")
+    setup.add_argument("--omarchy-bar-pills", metavar="JSON",
+                       help="Workspace pill preference edits for the json.paperland bar item, as a JSON object")
     setup.add_argument("--runtime-preferences", help="Validated runtime preference edits as JSON")
     setup.add_argument("--runtime-baseline", help="Runtime values observed before editing as JSON")
     setup.add_argument("--minimap-blur", choices=["keep", "on", "off"], default="keep")

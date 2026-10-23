@@ -37,14 +37,15 @@ function command(stableId, destination, follow, quote, source, required) {
         + ' then error("The selection changed before dispatch.") end; ';
     });
   }
+  var guard = "";
   if (source !== undefined) {
     if (!Number.isInteger(source)) return "";
-    code += 'if not w.workspace or w.workspace.id~=' + source
-      + ' then error("That window left its source Desktop.") end; ';
+    guard = source;
   }
   var selector;
   if (destination.kind === "floating") {
     if (!Number.isInteger(destination.id)) return "";
+    if (guard !== "") code += 'if not w.workspace or w.workspace.id~=' + guard + ' then error("That window left its source Desktop.") end; ';
     return code + 'hl.dispatch(hl.dsp.window.float({window=w,action="set"})) end';
   }
   if (destination.kind === "existing") {
@@ -60,5 +61,8 @@ function command(stableId, destination, follow, quote, source, required) {
     if (!number(String(destination.id))) return "";
     selector = '"' + destination.id + '"';
   } else return "";
+  // A window already at the destination (a native group's other member moved with the first) is not an error.
+  if (guard !== "") code += 'if not w.workspace or (w.workspace.id~=' + guard + ' and w.workspace.id~=' + destination.id
+    + ') then error("That window left its source Desktop.") end; ';
   return code + 'hl.dispatch(hl.dsp.window.move({window=w,workspace=' + selector + ',follow=' + follow + '})) end';
 }

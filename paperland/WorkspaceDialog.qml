@@ -21,6 +21,13 @@ Item {
   readonly property var entry: !service ? null : workspace === "special:scratchpad"
     ? service.scratchpadForMonitor(dialogScreen ? dialogScreen.name : "") : service.catalog.entries[workspace] || null
   readonly property bool opened: mode !== ""
+  // Mode changes before the deferred forceActiveFocus takes effect; keys go to
+  // whichever control holds active focus once the compositor routes them here.
+  readonly property bool keyboardReady: mode === "menu" ? menu.activeFocus : mode === "remove" ? removeCard.activeFocus
+    : mode === "windows" ? preview.activeFocus && (!!preview.selectedAddress || preview.addresses.length === 0) : false
+  readonly property var focusState: ({ windowActive: menu.Window.active,
+    activeFocusItem: menu.Window.activeFocusItem ? String(menu.Window.activeFocusItem.objectName || menu.Window.activeFocusItem) : "",
+    menuFocus: menu.activeFocus, previewFocus: preview.activeFocus, selectedAddress: preview.selectedAddress })
   // Screen-logical invocation point; the layer covers the whole screen.
   property point anchorPoint: Qt.point(0, 0)
   // Where the popover's bottom sits when it opens upward: the top of the
@@ -42,7 +49,13 @@ Item {
   function pauseActivation(): void { activation.stop(); }
   function close(): void { activation.stop(); mode = ""; }
   function activate(address) { activation.address = address; activating(); close(); activation.restart(); }
-  onEntryChanged: if (opened && !entry) close()
+  // The removed Desktop disappears while its card reports the outcome; the card keeps its own copy.
+  onEntryChanged: if (opened && !entry && mode !== "remove") close()
+  // The windows-mode preview reports its slots like the other surfaces; the
+  // preview enables capture only while that mode is shown.
+  function captureRecords(): var { return preview.captureRecords("workspace-dialog"); }
+  Component.onCompleted: Native.Runtime.registerCaptureSurface(root)
+  Component.onDestruction: Native.Runtime.unregisterCaptureSurface(root)
   onModeChanged: if (mode === "windows") Qt.callLater(function() { preview.forceActiveFocus(); })
   Timer { id: activation; interval: 40; property string address: ""; onTriggered: if (root.service) root.service.activate(address) }
   PanelWindow {
@@ -62,7 +75,8 @@ Item {
     Connections {
       target: Hyprland
       function onFocusedMonitorChanged() {
-        if (root.opened && root.dialogScreen && Hyprland.focusedMonitor
+        // Removing the Desktop shown on another display lands that display, then restores focus; the card stays for its outcome.
+        if (root.opened && root.mode !== "remove" && root.dialogScreen && Hyprland.focusedMonitor
             && Hyprland.focusedMonitor.name !== root.dialogScreen.name) root.close();
       }
     }
@@ -73,7 +87,7 @@ Item {
       readonly property real room: 8
       width: popover ? Math.min(280, parent.width - 2 * room) : Math.min(500, parent.width - 32)
       height: popover ? Math.min(menu.implicitHeight + 12 + (peekRow.visible ? peekRow.implicitHeight + 6 : 0), parent.height - 2 * room)
-        : Math.min(root.mode === "windows" ? 420 : root.mode === "close" ? closeConfirm.implicitHeight + 32 : 310, parent.height - 32)
+        : Math.min(root.mode === "windows" ? 420 : root.mode === "close" ? closeConfirm.implicitHeight + 32 : root.mode === "remove" ? removeCard.implicitHeight + 32 : 310, parent.height - 32)
       // Open toward the side with room, like a native context menu.
       x: !popover ? (parent.width - width) / 2
         : Math.max(room, root.anchorPoint.x + width + room <= parent.width ? root.anchorPoint.x : root.anchorPoint.x - width)
@@ -90,6 +104,7 @@ Item {
         anchors.bottomMargin: 6 + (peekRow.visible ? peekRow.implicitHeight + 6 : 0)
         visible: root.mode === "menu"
         entry: root.entry
+        allEntries: root.service ? root.service.allEntries() : []
         followChecked: root.service ? root.service.scratchpadFollow : false
         welcomeAvailable: true
         onCancelled: root.close()
@@ -99,6 +114,7 @@ Item {
           else if (action === "welcome") { root.close(); root.welcomeRequested(); }
           else if (action === "follow") { root.service.setScratchpadFollow(!root.service.scratchpadFollow); root.close(); }
           else if (action === "close") { root.mode = "close"; closeConfirm.begin(root.workspace, menu.closable); }
+          else if (action === "remove") { root.mode = "remove"; removeCard.begin(root.entry, root.service.allEntries(), root.service.destinations); }
           else { root.mode = "rename"; editor.begin(root.workspace, root.entry.name, action === "clear"); }
         }
       }
@@ -141,6 +157,24 @@ Item {
         onCancelled: root.close()
         onConfirmed: function(id, targets) { root.close(); root.service.closeWindows(id, targets); }
       }
+      Shared.DesktopRemoveCard {
+        id: removeCard
+        objectName: "desktop-remove-card"
+        anchors.fill: parent; anchors.margins: 16
+        visible: root.mode === "remove"
+        foreground: "#eeeeee"
+        accent: "#a55eab"
+        onCancelled: root.close()
+        onConfirmed: run(root.service)
+        onRetryRequested: {
+          var current = root.service.catalog.entries[source];
+          if (current) retry(current, root.service.allEntries(), root.service.destinations); else root.close();
+        }
+      }
+      Connections {
+        target: root.service
+        function onRemovalFinished(outcome) { if (root.mode === "remove") removeCard.showResult(outcome); }
+      }
       Shared.WorkspacePreview {
         id: preview
         thumbnailSource: Qt.resolvedUrl("native/WindowThumbnail.qml")
@@ -153,6 +187,7 @@ Item {
         row: root.entry && !root.entry.special && root.service ? root.service.rows[root.workspace] || null : null
         keyboardMode: true
         focusedAddress: root.service ? root.service.focusedAddress : ""
+        urgentAddresses: root.service ? root.service.urgentAddresses : ({})
         onCancelled: root.close()
         onActivated: function(address) { root.activate(address); }
         onWindowMenuRequested: function(address, position) { Native.Runtime.sendMenu.openFor(address, root.dialogScreen, position); }

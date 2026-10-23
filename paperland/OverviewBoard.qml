@@ -47,7 +47,23 @@ Item {
   property int scopeWorkspace: -1
   property string focusedAddress: ""
   property var badgeAddresses: []
+  property var urgentAddresses: ({})
   property bool captureEnabled: false
+  // The capture report's surface name; Settings' preview board names its own.
+  property string captureSurface: "overview"
+  // Instantiated strip canvases, kept by the canvases themselves. The capture
+  // report covers them while the overview is shown (the host enables capture
+  // exactly then); a strip scrolled out of the list reports its slots as
+  // clipped by its own viewport.
+  property var captureMaps: []
+  function captureRecords(): var {
+    if (!board.captureEnabled) return [];
+    var records = [];
+    board.captureMaps.forEach(function(map) {
+      if (map.visible) records = records.concat(map.captureRecords(board.captureSurface));
+    });
+    return records;
+  }
   // Docked-list preference; Overview binds it to the saved setting.
   property bool listEnabled: true
   property int density: densityFull
@@ -431,6 +447,8 @@ Item {
           CanvasMap {
             id: stripCanvas
             objectName: "workspace-preview-map"
+            Component.onCompleted: board.captureMaps = board.captureMaps.concat([stripCanvas])
+            Component.onDestruction: board.captureMaps = board.captureMaps.filter(function(map) { return map !== stripCanvas; })
             Layout.fillWidth: true
             Layout.preferredHeight: strip.canvasHeight + strip.trackExtra
             visible: !!strip.row && strip.row.windows.length > 0
@@ -444,6 +462,7 @@ Item {
             density: board.density
             viewportTrackEnabled: true
             badgeAddresses: board.badgeAddresses
+            urgentAddresses: board.urgentAddresses
             query: board.query
             focusedAddress: board.focusedAddress
             selectedAddress: board.selectedAddress
@@ -718,6 +737,7 @@ Item {
         rowIds: board.rowIds
         windows: board.windows
         badgeAddresses: board.badgeAddresses
+        urgentAddresses: board.urgentAddresses
         query: board.query
         scopeMonitor: board.scopeMonitor
         scopeWorkspace: board.scopeWorkspace

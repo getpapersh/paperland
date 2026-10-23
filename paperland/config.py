@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""paperland config: read and change saved preferences, live through IPC when running."""
+"""paperland config: read and change saved preferences. The running shell follows settings.ini itself."""
 
 import json
 import os
@@ -7,29 +7,16 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import tempfile
 
 HERE = Path(__file__).resolve().parent
 SHELL = HERE / "shell.qml"
 USAGE = "Usage: paperland config {list|get KEY|set KEY VALUE|unset KEY|reload|path}"
 
 
-class Failure(Exception):
-    pass
-
-
-def load_registry():
-    text = (HERE / "SettingsRegistry.js").read_text()
-    match = re.search(r"// BEGIN registry\s*var KEYS = (\{.*?\});\s*// END registry", text, re.S)
-    return json.loads(match.group(1))
-
-
-KEYS = load_registry()
-
-
-def settings_path():
-    state = os.environ.get("XDG_STATE_HOME") or str(Path(os.environ.get("HOME") or Path.home()) / ".local/state")
-    return Path(state) / "paperland/settings.ini"
+sys.dont_write_bytecode = True  # shared/ is hashed into the build identity
+sys.path.insert(0, str(HERE / "shared"))
+import settings_ini  # noqa: E402
+from settings_ini import Failure, KEYS, settings_path, text_of, saved_values, read_lines  # noqa: E402
 
 
 # Mirrors parse/changes in SettingsRegistry.js; tests run both against the same cases.
@@ -56,48 +43,10 @@ def parse(key, text):
     return value
 
 
-def text_of(value):
-    return ("true" if value else "false") if isinstance(value, bool) else str(value)
-
-
 def changes(key, value):
     result = {key: value}
     result.update(KEYS[key].get("implies", {}).get(text_of(value), {}))
     return result
-
-
-# settings.ini is QSettings' INI file; registry keys live in [General] as key=value.
-def read_lines(path):
-    try:
-        return path.read_text(errors="surrogateescape").splitlines(keepends=True)
-    except FileNotFoundError:
-        return []
-
-
-def general_span(lines):
-    start = next((i + 1 for i, line in enumerate(lines) if line.strip() == "[General]"), None)
-    if start is None:
-        return None, None
-    end = next((i for i in range(start, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
-    return start, end
-
-
-def saved_values(lines):
-    # Qt merges repeated sections and the last copy wins, so an edit to the first would not stick.
-    if sum(line.strip() == "[General]" for line in lines) > 1:
-        raise Failure("settings.ini has more than one [General] section; merge them. Nothing was changed.")
-    start, end = general_span(lines)
-    values = {}
-    for line in lines[start:end] if start is not None else []:
-        key, sep, raw = line.partition("=")
-        key = key.strip()
-        if sep:
-            # An edit would replace one copy while another still decides the value.
-            if key in KEYS and key in values:
-                raise Failure(f"settings.ini has more than one {key} entry; remove the extra line. Nothing was changed.")
-            raw = raw.strip()
-            values[key] = raw[1:-1] if len(raw) >= 2 and raw[0] == raw[-1] == '"' else raw
-    return values
 
 
 def migration(saved):
@@ -110,46 +59,6 @@ def migration(saved):
     if re.fullmatch(r"[0-9]+", seconds) and 1 <= int(seconds) <= 60:
         result["peekSeconds"] = int(seconds)
     return result
-
-
-def edit(path, updates):
-    """Atomically writes updates ({key: value or None to remove}), leaving other lines intact."""
-    lines = read_lines(path)
-    if lines and not lines[-1].endswith("\n"):
-        lines[-1] += "\n"
-    start, end = general_span(lines)
-    if start is None:
-        lines += ["[General]\n"]
-        start = end = len(lines)
-    pending = dict(updates)
-    section = []
-    for line in lines[start:end]:
-        key = line.partition("=")[0].strip()
-        if "=" in line and key in pending:
-            value = pending.pop(key)
-            if value is not None:
-                section.append(f"{key}={text_of(value)}\n")
-        else:
-            section.append(line)
-    while section and not section[-1].strip():
-        section.pop()
-    section += [f"{key}={text_of(value)}\n" for key, value in pending.items() if value is not None]
-    if end < len(lines):
-        section.append("\n")
-    text = "".join(lines[:start] + section + lines[end:])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=".settings-", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", errors="surrogateescape") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if path.exists():
-            os.chmod(temporary, path.stat().st_mode & 0o777)
-        os.replace(temporary, path)
-    except BaseException:
-        os.unlink(temporary)
-        raise
 
 
 def shell_process_running():
@@ -210,8 +119,6 @@ def ipc(function, *args):
 
 
 def effective():
-    if running():
-        return ipc("configList")
     saved = saved_values(read_lines(settings_path()))
     saved.update({key: text_of(value) for key, value in migration(saved).items()})
     values = {}
@@ -241,14 +148,14 @@ def main(argv):
     elif verb in ("set", "unset"):
         key = args[0]
         value = parse(key, args[1]) if verb == "set" else known(key)["default"]
-        if running():
-            ipc("configSet", key, args[1]) if verb == "set" else ipc("configUnset", key)
-        else:
+        # The running shell applies the file change itself; migration is a no-op once it has recorded the upgrade.
+        with settings_ini.locked(settings_path()):
             path = settings_path()
+            settings_ini.check_pair(path, changes(key, value))
             updates = {**migration(saved_values(read_lines(path))), **changes(key, value)}
             if verb == "unset":
                 updates[key] = None
-            edit(path, updates)
+            settings_ini.edit(path, updates, hold=False)
     elif not running():
         print("Paperland is not running; saved settings load when it starts.", file=sys.stderr)
     else:

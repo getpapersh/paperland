@@ -15,9 +15,9 @@ Item {
   readonly property string defaultsPath: {
     var explicit = String(Quickshell.env("PAPERLAND_WORKSPACE_NAMES_FILE") || "");
     if (explicit !== "") return explicit;
-    var config = String(Quickshell.env("XDG_CONFIG_HOME") || "");
-    if (config === "") config = String(Quickshell.env("HOME") || "") + "/.config";
-    return config + "/hypr/paperland-workspace-names.lua";
+    var state = String(Quickshell.env("XDG_STATE_HOME") || "");
+    if (state === "") state = String(Quickshell.env("HOME") || "") + "/.local/state";
+    return state + "/paperland/hypr/paperland-workspace-names.lua";
   }
   readonly property string session: String(Quickshell.env("HYPRLAND_INSTANCE_SIGNATURE") || "")
   property var entries: ({})

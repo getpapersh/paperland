@@ -32,12 +32,24 @@ load_input_bridge() {
   fi
   hyprctl plugin load "$binary" >/dev/null || echo "Paperland input bridge could not load; click, pill, grip, and badge controls remain available. Canvas pan needs verified direction while monitor-aware integration is on." >&2
 }
+# Until a symlinked main config includes the new generated file, Hyprland still loads the old
+# names file, so the name editor must keep writing there.
+use_active_names_file() {
+  local new="${XDG_STATE_HOME:-$HOME/.local/state}/paperland/hypr/paperland-workspace-names.lua"
+  local old="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/paperland-workspace-names.lua"
+  if [[ -z "${PAPERLAND_WORKSPACE_NAMES_FILE:-}" && ! -e "$new" && -e "$old" ]]; then
+    export PAPERLAND_WORKSPACE_NAMES_FILE="$old"
+  fi
+}
 action=${1:-start}
 if (( $# )); then shift; fi
 case "$action" in
   setup)
     setup_desktop_bridge=false
-    if [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/hypr/paperland-desktop-directions.lua" ]]; then
+    generated_dir="${XDG_STATE_HOME:-$HOME/.local/state}/paperland/hypr"
+    # The old file counts only while the new generated include does not exist yet.
+    if [[ -f "$generated_dir/paperland-desktop-directions.lua" ]] \
+      || [[ ! -f "$generated_dir/paperland.lua" && -f "${XDG_CONFIG_HOME:-$HOME/.config}/hypr/paperland-desktop-directions.lua" ]]; then
       setup_desktop_bridge=true
     fi
     for setup_arg in "$@"; do
@@ -61,10 +73,12 @@ case "$action" in
     ;;
   start)
     load_input_bridge
+    use_active_names_file
     exec env QT_QUICK_CONTROLS_STYLE=Basic quickshell --no-duplicate -p "$paperland_dir/shell.qml" "$@"
     ;;
   start-hidden)
     load_input_bridge
+    use_active_names_file
     exec env PAPERLAND_START_HIDDEN=1 QT_QUICK_CONTROLS_STYLE=Basic quickshell --no-duplicate -d -p "$paperland_dir/shell.qml" "$@"
     ;;
   demo)
@@ -87,6 +101,117 @@ case "$action" in
     ;;
   stop-safe)
     exec quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland requestStop
+    ;;
+  diagnostics)
+    # Read-only: whether each host answers IPC, its running build identity
+    # against a fresh hash of the installed files, and the standalone
+    # runtime's classification of a fresh live bind query, polled quietly.
+    if (( $# )); then
+      echo "Usage: paperland diagnostics" >&2
+      exit 2
+    fi
+    diagnostics_host() {
+      local name=$1 label=$2 shell=$3 target=$4 running hash installed=null running_id=null result=unknown reason=""
+      shift 4
+      if hash=$("$paperland_dir/paperland" identity "$@" 2>/dev/null); then installed="\"$hash\""; else reason="Hashing the installed files failed."; fi
+      if ! running=$(quickshell ipc -p "$shell" call -- "$target" identity 2>/dev/null) || [[ $running != '{'*'}' ]]; then
+        # A runtime started before identity reporting still answers status.
+        if quickshell ipc -p "$shell" call -- "$target" status >/dev/null 2>&1; then
+          printf '"%s":{"reachable":true,"identity":{"result":"unknown","reason":"The running %s predates identity reporting; restart it.","running":null,"installed":%s}}' \
+            "$name" "$label" "$installed"
+        else
+          printf '"%s":{"reachable":false,"reason":"The %s did not answer IPC.","identity":{"result":"unknown","reason":"No running identity without IPC.","running":null,"installed":%s}}' \
+            "$name" "$label" "$installed"
+        fi
+        return
+      fi
+      if [[ $running =~ \"identity\":\"([0-9a-f]{16})\" ]]; then
+        running_id="\"${BASH_REMATCH[1]}\""
+      elif [[ -z $reason ]]; then
+        # Lift the runtime's own JSON-escaped reason, such as "still being computed".
+        if [[ $running =~ \"reason\":\"((\\.|[^\"\\])*)\" ]]; then reason=${BASH_REMATCH[1]}; else reason="The running identity is unavailable."; fi
+      fi
+      if [[ $running_id != null && $installed != null ]]; then
+        [[ $running_id == "$installed" ]] && result=match || result=mismatch
+      fi
+      [[ $result == unknown ]] && reason=",\"reason\":\"$reason\"" || reason=
+      printf '"%s":{"reachable":true,"identity":{"result":"%s"%s,"running":%s,"installed":%s}}' \
+        "$name" "$result" "$reason" "$running_id" "$installed"
+    }
+    diagnostics_reply="{$(diagnostics_host standalone "standalone runtime" "$paperland_dir/shell.qml" paperland "$paperland_dir")"
+    diagnostics_plugin="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/json.paperland"
+    if [[ -e $diagnostics_plugin ]]; then
+      diagnostics_reply+=",$(diagnostics_host bar "Omarchy bar host" "${OMARCHY_PATH:-/usr/share/omarchy}/shell/shell.qml" paperlandBar \
+        "$diagnostics_plugin" "$diagnostics_plugin/paperland")"
+    fi
+    if quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland status >/dev/null 2>&1; then
+      diagnostics_shortcuts='{"incomplete":true,"reason":"The running standalone runtime predates bind diagnostics; restart it."}'
+    else
+      diagnostics_shortcuts='{"incomplete":true,"reason":"The standalone runtime did not answer IPC; live binds were not inspected."}'
+    fi
+    if diagnostics_request=$(quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland diagnosticsBegin 2>/dev/null) \
+        && [[ -n $diagnostics_request ]]; then
+      # Microseconds; each IPC call takes time too, so the deadline is wall-clock.
+      diagnostics_deadline=$(( ${EPOCHREALTIME//[^0-9]/} + 5000000 ))
+      while :; do
+        if ! diagnostics_status=$(quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland diagnosticsStatus "$diagnostics_request" 2>/dev/null) \
+            || [[ $diagnostics_status != '{'*'}' ]]; then
+          diagnostics_shortcuts='{"incomplete":true,"reason":"The standalone runtime stopped answering IPC during the bind query."}'
+          break
+        fi
+        if [[ $diagnostics_status != '{"pending":true}' ]]; then diagnostics_shortcuts=$diagnostics_status; break; fi
+        if (( ${EPOCHREALTIME//[^0-9]/} >= diagnostics_deadline )); then
+          diagnostics_shortcuts='{"incomplete":true,"reason":"The live bind query did not finish within 5 seconds."}'
+          break
+        fi
+        sleep 0.1
+      done
+    fi
+    printf '%s,"shortcuts":%s}\n' "$diagnostics_reply" "$diagnostics_shortcuts"
+    ;;
+  identity)
+    # Internal plumbing for the hosts and `diagnostics`, not a public command.
+    # Content hash of the runtime files a host loads: this launcher's tree, or
+    # the given roots. Only the set the installer copies counts, so user config
+    # (which lives outside these trees) and checkout extras never change it.
+    # find -P never follows a symlink, so the plugin's `paperland -> ..` link
+    # cannot loop or double-count; a root that is itself a link is resolved once.
+    (( $# )) || set -- "$paperland_dir"
+    identity_roots=()
+    for identity_root in "$@"; do
+      identity_resolved=$(readlink -e -- "$identity_root") || { echo "Identity root is missing: $identity_root" >&2; exit 1; }
+      identity_roots+=("$identity_resolved")
+    done
+    for identity_index in "${!identity_roots[@]}"; do
+      (
+        cd -- "${identity_roots[$identity_index]}"
+        {
+          find -P . -maxdepth 1 -type f \( -name '*.qml' -o -name '*.js' -o -name qmldir -o -name paperland \
+            -o -name setup.py -o -name manifest.json \) -print0
+          for identity_dir in shared native lua fixtures omarchy plugin; do
+            if [[ -d $identity_dir && ! -L $identity_dir ]]; then find -P "$identity_dir" -type f -print0; fi
+          done
+        } | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sed "s|  |  $identity_index/|"
+      )
+    done | sha256sum | cut -c1-16
+    ;;
+  captures)
+    # One object keyed per host. The runtime treats anything but "detail" as
+    # the privacy-preserving default, so a bare `captures` sends an explicit
+    # empty argument. A host that does not answer is a coverage gap, never a
+    # reconstructed list; the bar host is asked only when its plugin exists.
+    if (( $# > 1 )) || [[ ${1:-} != "" && $1 != detail ]]; then
+      echo "Usage: paperland captures [detail]" >&2
+      exit 2
+    fi
+    captures_reply=$(quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland captures "${1:-}" 2>/dev/null) || captures_reply=
+    [[ $captures_reply == '{'*'}' ]] || captures_reply='{"standalone":{"reachable":false,"reason":"The standalone runtime did not answer IPC."}}'
+    if [[ -e "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/json.paperland" ]]; then
+      captures_bar=$(quickshell ipc -p "${OMARCHY_PATH:-/usr/share/omarchy}/shell/shell.qml" call -- paperlandBar captures "${1:-}" 2>/dev/null) || captures_bar=
+      [[ $captures_bar == '{'*'}' ]] || captures_bar='{"bar":{"reachable":false,"reason":"The Omarchy bar host did not answer the captures IPC."}}'
+      captures_reply="${captures_reply%\}},${captures_bar#\{}"
+    fi
+    printf '%s\n' "$captures_reply"
     ;;
   whats-new)
     exec quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland whatsNew "$@"
@@ -112,6 +237,9 @@ case "$action" in
     ;;
   strip-badges)
     exec quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland stripBadges "$@"
+    ;;
+  strip-columns)
+    exec quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland stripColumns "$@"
     ;;
   switcher-size)
     exec quickshell ipc -p "$paperland_dir/shell.qml" call -- paperland switcherSize "$@"
@@ -188,7 +316,7 @@ case "$action" in
     exit "$names_final_rc"
     ;;
   *)
-    echo "Usage: paperland {install|setup|uninstall|start|start-hidden|demo|show|hide|toggle|search|settings|welcome|whats-new|version|status|peek on/off/SECONDS|pin true/false|switch-overlay on/off|switcher-size small/medium/large/xl|switcher-all-displays on/off|activate ADDRESS|pan WORKSPACE PIXELS|direction WORKSPACE right/left/up/down/global|instances|stop-safe|names {begin WORKSPACE|submit JSON|status REQUEST_ID}|config {list|get KEY|set KEY VALUE|unset KEY|reload|path}|stop}" >&2
+    echo "Usage: paperland {install|setup|uninstall|start|start-hidden|demo|show|hide|toggle|search|settings|welcome|whats-new|version|status|captures [detail]|diagnostics|peek on/off/SECONDS|pin true/false|switch-overlay on/off|switcher-size small/medium/large/xl|switcher-all-displays on/off|activate ADDRESS|pan WORKSPACE PIXELS|direction WORKSPACE right/left/up/down/global|instances|stop-safe|names {begin WORKSPACE|submit JSON|status REQUEST_ID}|config {list|get KEY|set KEY VALUE|unset KEY|reload|path}|stop}" >&2
     exit 2
     ;;
 esac

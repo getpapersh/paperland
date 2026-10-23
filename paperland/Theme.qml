@@ -27,6 +27,8 @@ QtObject {
   readonly property color viewportBorder: alpha(accent, 0.45)
   readonly property color thumbnailLetterbox: alpha("#000000", 0.25)
   readonly property real unmatchedThumbnailOpacity: 0.23
+  // Static attention marks share one color across window surfaces.
+  readonly property color urgent: "#e04f4f"
   readonly property color scrim: Qt.rgba(0, 0, 0, 0.75)
   // Workspace switch card: translucent over arbitrary desktop content, so its
   // text tiers are held to 4.5:1 over both black and white backdrops

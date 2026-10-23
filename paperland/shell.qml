@@ -1,17 +1,18 @@
 import QtQuick
-import QtCore
 import Quickshell
 import Quickshell.Io
 import Quickshell.Hyprland
 import "Layout.js" as Layout
 import "SettingsRegistry.js" as Registry
+import "SettingsIni.js" as Ini
 import "native" as Native
 
 ShellRoot {
   id: root
-  Settings {
+  // Live values. Changes persist through SettingsFile's writer (root.persist); the file's contents
+  // flow back in through applyFile, so every writer's change reaches these properties.
+  QtObject {
     id: settings
-    location: "file://" + (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state") + "/paperland/settings.ini"
     property bool pinned: Registry.KEYS.pinned.default
     property bool peek: Registry.KEYS.peek.default
     property int peekSeconds: Registry.KEYS.peekSeconds.default
@@ -29,18 +30,25 @@ ShellRoot {
     // Whether an open scratchpad replaces the desktop on its display's strip.
     property bool scratchpadFollow: Registry.KEYS.scratchpadFollow.default
     // PaperMac's "Show Desktop number on switch", on by default.
-    property bool switchOverlay: true
+    property bool switchOverlay: Registry.KEYS.switchOverlay.default
     // Alt+Tab search matching, as in PaperMac: "fuzzy" (default) or "exact".
-    property string switcherSearchMode: "fuzzy"
+    property string switcherSearchMode: Registry.KEYS.switcherSearchMode.default
     // Alt+Tab card size preset (small, medium, large, xl) and mirroring onto every display.
-    property string switcherSize: "large"
-    property bool switcherOnAllDisplays: false
+    property string switcherSize: Registry.KEYS.switcherSize.default
+    property bool switcherOnAllDisplays: Registry.KEYS.switcherOnAllDisplays.default
     // Set once the first-run welcome is closed by any route.
     property bool welcomeShown: false
     // Empty until the first start records the running version (fresh install).
     property string whatsNewLastSeenVersion: ""
   }
-  readonly property string switcherSize: ["small", "medium", "large", "xl"].indexOf(settings.switcherSize) >= 0 ? settings.switcherSize : "large"
+  SettingsFile {
+    id: file
+    path: (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state") + "/paperland/settings.ini"
+    writer: Quickshell.shellPath("shared/settings_ini.py")
+    onChanged: text => root.applyFile(text)
+  }
+  readonly property string switcherSearchMode: Registry.KEYS.switcherSearchMode.values.indexOf(settings.switcherSearchMode) >= 0 ? settings.switcherSearchMode : Registry.KEYS.switcherSearchMode.default
+  readonly property string switcherSize: Registry.KEYS.switcherSize.values.indexOf(settings.switcherSize) >= 0 ? settings.switcherSize : Registry.KEYS.switcherSize.default
   readonly property int peekSeconds: Math.max(1, Math.min(60, settings.peekSeconds))
   readonly property string minimapOpacityMode: settings.minimapOpacityMode === "entire" ? "entire" : "background"
   readonly property int minimapBackgroundOpacity: Math.max(0, Math.min(100, settings.minimapBackgroundOpacity))
@@ -50,19 +58,35 @@ ShellRoot {
   readonly property bool startupHidden: Quickshell.env("PAPERLAND_START_HIDDEN") === "1"
   Binding { target: root.service; property: "pinned"; value: settings.pinned }
   Component.onCompleted: {
+    var saved = file.read();
+    if (saved !== null) root.applyFile(saved);
     root.migrateSettings();
     root.pushFollowToLua();
+    Native.Runtime.computeIdentity([Native.Runtime.runtimeDir]);
     // Native E2E harnesses start from empty state; the card would cover their fixtures.
-    if (!settings.welcomeShown && Quickshell.env("PAPERLAND_E2E") !== "1") onboarding.openWelcome();
+    if (!settings.welcomeShown && Quickshell.env("PAPERLAND_E2E") !== "1") {
+      onboarding.openWelcome();
+      whatsNewPending = true;
+    }
     // Its file readers start loading only once the whole tree has completed.
-    Qt.callLater(root.showWhatsNew);
+    Qt.callLater(root.releaseWhatsNew);
+  }
+  // Set only for the start that opened the card; one surface at a time, so the
+  // notes wait for the card and then the coach, and replays never re-arm it.
+  property bool whatsNewPending: false
+  function releaseWhatsNew(): void {
+    if (onboarding.welcomeOpen || onboarding.coachOpen) return;
+    // Skipping leaves the saved version alone, so the notes show on the next start.
+    var skip = whatsNewPending && whatsNewWindow.opened;
+    whatsNewPending = false;
+    if (!skip) showWhatsNew();
   }
   function showWhatsNew(): void {
     // Saved before dismissal so quitting with the window open never re-shows it.
     var seen = whatsNewWindow.showUnseen(settings.whatsNewLastSeenVersion);
     if (seen !== settings.whatsNewLastSeenVersion) {
       settings.whatsNewLastSeenVersion = seen;
-      settings.sync();
+      root.persist(["whatsNewLastSeenVersion"]);
     }
   }
   // The Lua module can finish initializing after this shell starts; each flip
@@ -85,10 +109,11 @@ ShellRoot {
       settings.peek = !settings.pinned;
       if (settings.autoHideSeconds >= 1 && settings.autoHideSeconds <= 60) settings.peekSeconds = settings.autoHideSeconds;
       settings.settingsVersion = 1;
+      root.persist(["settingsVersion", "peek", "peekSeconds"]);
     } else if (settings.pinned && settings.peek) {
       settings.peek = false;
-    } else return;
-    settings.sync();
+      root.persist(["peek"]);
+    }
   }
   Binding { target: root.service; property: "workspaceDirections"; value: settings.workspaceDirections }
   Binding { target: overview; property: "windowListEnabled"; value: settings.overviewWindowList }
@@ -98,11 +123,11 @@ ShellRoot {
     target: overview
     function onWindowListToggleRequested(value) {
       settings.overviewWindowList = value;
-      settings.sync();
+      root.persist(["overviewWindowList"]);
     }
     function onDensityChangeRequested(value) {
       settings.overviewDensity = value;
-      settings.sync();
+      root.persist(["overviewDensity"]);
     }
   }
   Connections {
@@ -113,11 +138,11 @@ ShellRoot {
     function onPinRequested(value) {
       settings.pinned = value;
       settings.peek = !value;
-      settings.sync();
+      root.persist(["pinned", "peek"]);
     }
     function onFollowRequested(value) {
       settings.scratchpadFollow = value;
-      settings.sync();
+      root.persist(["scratchpadFollow"]);
       root.pushFollowToLua();
     }
   }
@@ -146,7 +171,7 @@ ShellRoot {
   WindowSwitcher {
     id: switcher
     service: root.service
-    searchMode: settings.switcherSearchMode === "exact" ? "exact" : "fuzzy"
+    searchMode: root.switcherSearchMode
     sizePreset: root.switcherSize
     allDisplays: settings.switcherOnAllDisplays
     onStarting: { overview.close(); whatsNewWindow.close(); }
@@ -173,7 +198,12 @@ ShellRoot {
     id: onboarding
     service: root.service
     minimapVisible: overview.visibleMinimaps > 0
-    onWelcomeClosed: { settings.welcomeShown = true; settings.sync(); }
+    onWelcomeClosed: {
+      settings.welcomeShown = true; root.persist(["welcomeShown"]);
+      // Start Flowing opens the coach right after this signal; check afterwards.
+      if (root.whatsNewPending) Qt.callLater(root.releaseWhatsNew);
+    }
+    onCoachOpenChanged: if (!coachOpen && root.whatsNewPending) Qt.callLater(root.releaseWhatsNew)
     onFlowStarted: overview.showMinimap()
     onMinimapShowRequested: overview.showMinimap()
   }
@@ -188,55 +218,79 @@ ShellRoot {
     savedPreferences: ({pinned: settings.pinned, peek: settings.peek, peekSeconds: root.peekSeconds,
       minimapOpacityMode: root.minimapOpacityMode, minimapBackgroundOpacity: root.minimapBackgroundOpacity,
       minimapEntireOpacity: root.minimapEntireOpacity, overviewWindowList: settings.overviewWindowList,
-      overviewDensity: root.overviewDensity, scratchpadFollow: settings.scratchpadFollow})
-    // Qt Settings has no external change notifications; refresh its properties after the checked writer saves.
+      overviewDensity: root.overviewDensity, scratchpadFollow: settings.scratchpadFollow,
+      switchOverlay: settings.switchOverlay, switcherSearchMode: root.switcherSearchMode,
+      switcherSize: root.switcherSize, switcherOnAllDisplays: settings.switcherOnAllDisplays})
+    // The file watcher usually delivers a Save first; this rereads right away so the draft resets from saved values.
     onPreferencesReloadRequested: root.reloadSettings()
   }
 
-  function applySettings(values: var): void {
+  // Persists the named settings through the shared writer. The live value is already assigned.
+  function persist(keys: var): void {
+    var updates = {};
+    for (var i = 0; i < keys.length; i++) {
+      var value = settings[keys[i]];
+      updates[keys[i]] = keys[i] === "workspaceDirections" ? JSON.stringify(value) : value;
+    }
+    file.write(updates);
+  }
+  // Applies settings.ini's text. A key with a write in flight keeps its newer live value; invalid
+  // entries keep the live value and are reported.
+  function applyFile(text: string): var {
+    var saved = Ini.parse(text);
+    var follow = settings.scratchpadFollow;
+    var result = Registry.read(function(key, fallback) { return key in saved ? saved[key] : fallback; }, settings);
+    var values = {};
+    for (var key in result.values) if (!file.isPending(key)) values[key] = result.values[key];
     Registry.apply(settings, values);
-    if ("scratchpadFollow" in values) root.pushFollowToLua();
-  }
-  function applyConfig(result: var): string {
-    if (result.ok) root.applySettings(result.changes);
-    return JSON.stringify(result);
-  }
-  // Rereads settings.ini; invalid entries keep the live value and are reported.
-  function reloadSettings(): var {
-    var result = Registry.reload(settings);
-    root.pushFollowToLua();
+    var internal = Registry.readInternal(function(key) { return saved[key]; });
+    for (var name in internal) {
+      if (file.isPending(name)) continue;
+      var next = internal[name];
+      if (name === "workspaceDirections") {
+        if (JSON.stringify(next) !== JSON.stringify(settings.workspaceDirections)) settings.workspaceDirections = next;
+      } else settings[name] = next;
+    }
+    if (settings.scratchpadFollow !== follow) root.pushFollowToLua();
+    root.lastRead = result;
     return result;
+  }
+  property var lastRead: ({ values: {}, errors: [] })
+  // Rereads settings.ini now; the file watcher normally has already delivered it.
+  function reloadSettings(): var {
+    file.refresh();
+    return root.lastRead;
   }
   function setPeek(value) {
     if (value && settings.pinned) root.service.setPinned(false);
     settings.peek = value;
-    settings.sync();
+    root.persist(["peek"]);
     return true;
   }
   function setSwitcherSize(preset: string): bool {
-    if (["small", "medium", "large", "xl"].indexOf(preset) < 0) return false;
+    if (Registry.KEYS.switcherSize.values.indexOf(preset) < 0) return false;
     settings.switcherSize = preset;
-    settings.sync();
+    root.persist(["switcherSize"]);
     return true;
   }
   function setPeekSeconds(seconds) {
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > 60) return false;
     settings.peekSeconds = seconds;
-    settings.sync();
+    root.persist(["peekSeconds"]);
     return true;
   }
   function setMinimapOpacityMode(mode: string): bool {
     if (mode !== "background" && mode !== "entire") return false;
     settings.minimapOpacityMode = mode;
-    settings.sync();
+    root.persist(["minimapOpacityMode"]);
     return true;
   }
   function setMinimapOpacityValue(value: int): bool {
     var minimum = root.minimapOpacityMode === "entire" ? 20 : 0;
     if (!Number.isInteger(value) || value < minimum || value > 100) return false;
-    if (root.minimapOpacityMode === "entire") settings.minimapEntireOpacity = value;
-    else settings.minimapBackgroundOpacity = value;
-    settings.sync();
+    var key = root.minimapOpacityMode === "entire" ? "minimapEntireOpacity" : "minimapBackgroundOpacity";
+    settings[key] = value;
+    root.persist([key]);
     return true;
   }
   ActivationNotice { service: root.service; noticeScreen: Hyprland.focusedMonitor ? Quickshell.screens.find(function(screen) { return screen.name === Hyprland.focusedMonitor.name; }) || null : null }
@@ -278,20 +332,20 @@ ShellRoot {
     function switcherAllDisplays(value: string): bool {
       if (value !== "on" && value !== "off") return false;
       settings.switcherOnAllDisplays = value === "on";
-      settings.sync();
+      root.persist(["switcherOnAllDisplays"]);
       return true;
     }
     function follow(value: string): bool {
       if (value !== "on" && value !== "off") return false;
       settings.scratchpadFollow = value === "on";
-      settings.sync();
+      root.persist(["scratchpadFollow"]);
       root.pushFollowToLua();
       return true;
     }
     function switchOverlay(value: string): bool {
       if (value !== "on" && value !== "off") return false;
       settings.switchOverlay = value === "on";
-      settings.sync();
+      root.persist(["switchOverlay"]);
       return true;
     }
     function direction(workspace: int, value: string): bool {
@@ -300,18 +354,16 @@ ShellRoot {
       if (value === "global") delete directions[workspace];
       else directions[workspace] = value;
       settings.workspaceDirections = directions;
-      settings.sync();
+      root.persist(["workspaceDirections"]);
       return true;
     }
-    // `paperland config`: replies are JSON so the CLI can report validation errors.
-    function configList(): string { return JSON.stringify(Registry.snapshot(settings)); }
-    function configSet(key: string, value: string): string { return root.applyConfig(Registry.resolve(key, value)); }
-    function configUnset(key: string): string { return root.applyConfig(Registry.reset(key)); }
+    // `paperland config set` and `unset` write the file; the shell follows it. Reload forces a reread.
     function configReload(): string {
       var result = root.reloadSettings();
       return JSON.stringify({ ok: true, values: result.values, errors: result.errors });
     }
     function stripBadges(payload: string): bool { return Native.Runtime.showStripBadges(payload); }
+    function stripColumns(payload: string): bool { return Native.Runtime.showStripColumns(payload); }
     function quit(): void { Qt.quit(); }
     function requestStop(): bool {
       if (settingsWindow.stopBlocked) return false;
@@ -326,9 +378,9 @@ ShellRoot {
       return true;
     }
     function status(): string {
-      return JSON.stringify({ switcherOpened: switcher.opened, switcherSelected: switcher.selected, switcherIds: switcher.ids, switcherPending: switcher.pendingTarget, activationError: service.activationError, opened: overview.opened, welcomeOpened: onboarding.welcomeOpen, coachLesson: onboarding.coachOpen ? onboarding.lesson.id : "", coachFeedback: onboarding.coach.feedback, coachWaiting: onboarding.cold.waiting, coachInstruction: onboarding.coachOpen ? onboarding.coachInstruction : "", workspaceActionsOpened: overview.workspaceActionsOpened, minimapVisible: overview.visibleMinimaps > 0, visibleMinimaps: overview.visibleMinimaps, pinned: service.pinned, peek: settings.peek, peekSeconds: root.peekSeconds, minimapOpacityMode: root.minimapOpacityMode, minimapBackgroundOpacity: root.minimapBackgroundOpacity, minimapEntireOpacity: root.minimapEntireOpacity, scratchpadFollow: settings.scratchpadFollow, switchOverlay: settings.switchOverlay,
+      return JSON.stringify({ switcherOpened: switcher.opened, switcherSelected: switcher.selected, switcherIds: switcher.ids, switcherPending: switcher.pendingTarget, activationError: service.activationError, opened: overview.opened, welcomeOpened: onboarding.welcomeOpen, coachLesson: onboarding.coachOpen ? onboarding.lesson.id : "", coachFeedback: onboarding.coach.feedback, coachWaiting: onboarding.cold.waiting, coachInstruction: onboarding.coachOpen ? onboarding.coachInstruction : "", workspaceActionsOpened: overview.workspaceActionsOpened, workspaceActionsMode: overview.workspaceActionsMode, workspaceActionsKeyboardReady: overview.workspaceActionsKeyboardReady, workspaceActionsFocus: overview.workspaceActionsFocus, minimapVisible: overview.visibleMinimaps > 0, visibleMinimaps: overview.visibleMinimaps, pinned: service.pinned, peek: settings.peek, peekSeconds: root.peekSeconds, minimapOpacityMode: root.minimapOpacityMode, minimapBackgroundOpacity: root.minimapBackgroundOpacity, minimapEntireOpacity: root.minimapEntireOpacity, scratchpadFollow: settings.scratchpadFollow, switchOverlay: settings.switchOverlay,
         overviewWindowList: settings.overviewWindowList, overviewDensity: root.overviewDensity,
-        switcherSize: root.switcherSize, switcherOnAllDisplays: settings.switcherOnAllDisplays,
+        switcherSize: root.switcherSize, switcherSearchMode: root.switcherSearchMode, switcherOnAllDisplays: settings.switcherOnAllDisplays,
         query: overview.query, matches: overview.matchIds.length, selected: overview.selectedAddress,
         searchFocused: overview.searchFocused, scope: overview.scope,
         scopeMonitor: overview.scopeMonitor, scopeWorkspace: overview.scopeWorkspace,
@@ -343,5 +395,15 @@ ShellRoot {
             direction: row.direction, directionSource: row.directionSource };
         }) });
     }
+    // Read-only capture health. Slots self-report through their own bindings;
+    // window text stays out unless the request explicitly asks for detail.
+    function captures(detail: string): string {
+      // The Alt+Tab switcher shows live thumbnails but does not self-report.
+      return Native.Runtime.captureReport("standalone", detail === "detail", [{ surface: "switcher",
+        reason: "The window switcher's thumbnails do not report capture state." }]);
+    }
+    function identity(): string { return Native.Runtime.identityReport(); }
+    function diagnosticsBegin(): string { return Native.Runtime.beginDiagnostics(); }
+    function diagnosticsStatus(request: string): string { return Native.Runtime.diagnosticsStatus(request); }
   }
 }

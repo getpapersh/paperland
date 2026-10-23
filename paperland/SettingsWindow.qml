@@ -7,7 +7,9 @@ import Quickshell.Io
 import Quickshell.Hyprland
 import Quickshell.Wayland
 import "native" as Native
+import "SettingsRegistry.js" as Registry
 import "SettingsSearch.js" as SettingsSearch
+import "shared/StripColumns.js" as Pill
 
 Item {
   id: root
@@ -34,6 +36,10 @@ Item {
   property bool overviewWindowList: true
   property int overviewDensity: 0
   property bool scratchpadFollow: true
+  property bool switchOverlay: true
+  property string switcherSearchMode: "fuzzy"
+  property string switcherSize: "large"
+  property bool switcherOnAllDisplays: false
   property string selectedSection: "Minimap"
   property string selectedCard: ""
   onSelectedSectionChanged: {
@@ -54,6 +60,15 @@ Item {
   readonly property string effectiveBarPanels: root.stagedBarPanels === "keep" ? (root.currentSetup.bar_panels || "drop") : root.stagedBarPanels
   property string stagedBar: "keep"
   property string stagedBarScratchpad: "keep"
+  // Workspace-pill edits: only keys that differ from the saved json.paperland
+  // values. The bar item in shell.json owns them, never settings.ini.
+  property var stagedPills: ({})
+  readonly property var currentPills: Pill.normalizePillSettings(function(key, fallback) {
+    var saved = (root.currentSetup.bar_pills || {})[key];
+    return saved === undefined || saved === null ? fallback : saved;
+  })
+  readonly property bool pillsEditable: !!currentSetup.bar_available
+    && (stagedBar === "enable" || stagedBar === "keep" && currentSetup.omarchy_bar === true)
   property string stagedMonitorDirection: "keep"
   property var stagedMonitorOverrides: ({})
   property var stagedDesktopDirections: ({})
@@ -78,6 +93,7 @@ Item {
   readonly property bool hasStaged: hasRuntimeDraft || stagedBlur !== "keep" || stagedAutostart !== "keep" || stagedShortcut !== "keep"
     || stagedResize !== "keep" || stagedCentering !== "keep" || stagedStripChord !== "keep"
     || stagedBarPanels !== "keep" || stagedBar !== "keep" || stagedBarScratchpad !== "keep"
+    || Object.keys(stagedPills).length > 0
     || stagedMonitorDirection !== "keep" || Object.keys(stagedMonitorOverrides).length > 0
     || Object.keys(stagedDesktopDirections).length > 0
   readonly property bool stopBlocked: hasStaged || applyUnresolved || previewProcess.running || statusProcess.running
@@ -95,7 +111,7 @@ Item {
   // The Apply attempt this window is waiting on; empty when recovering on open.
   // It only routes receipts to the consent that produced them; it authorizes nothing.
   property string currentAttempt: ""
-  readonly property var sections: ["Minimap", "Overview", "Displays", "Shortcuts", "Startup & Bar"]
+  readonly property var sections: ["Minimap", "Overview", "Switcher", "Displays", "Shortcuts", "Startup & Bar"]
   readonly property var searchEntries: SettingsSearch.entries()
   readonly property var searchResults: SettingsSearch.rank(searchEntries, query)
   property int resultIndex: -1
@@ -108,7 +124,36 @@ Item {
     return {pinned: pinned, peek: peekEnabled, peekSeconds: peekSeconds,
       minimapOpacityMode: opacityMode, minimapBackgroundOpacity: backgroundOpacity,
       minimapEntireOpacity: entireOpacity, overviewWindowList: overviewWindowList,
-      overviewDensity: overviewDensity, scratchpadFollow: scratchpadFollow};
+      overviewDensity: overviewDensity, scratchpadFollow: scratchpadFollow,
+      switchOverlay: switchOverlay, switcherSearchMode: switcherSearchMode,
+      switcherSize: switcherSize, switcherOnAllDisplays: switcherOnAllDisplays};
+  }
+  function choiceLabel(value: string): string {
+    return value === "xl" ? "XL" : value.charAt(0).toUpperCase() + value.slice(1);
+  }
+  function pillValue(key: string): var {
+    return Object.prototype.hasOwnProperty.call(stagedPills, key) ? stagedPills[key] : currentPills[key];
+  }
+  function stagePill(key: string, value: var): void {
+    var next = Object.assign({}, stagedPills);
+    if (currentPills[key] === value) delete next[key];
+    else next[key] = value;
+    stagedPills = next;
+  }
+  // A text sketch of three Desktops (1 active with three windows) under the
+  // staged pill options; ▪ stands for an app icon.
+  function barPreview(): string {
+    var raised = ["", "\u00b9", "\u00b2", "\u00b3"], counts = [3, 1, 0];
+    // A bar item staged for removal shows no pills at all, so no icons.
+    var icons = pillsEditable && pillValue("showIcons") === true ? pillValue("iconsOn") : "";
+    var slots = Math.min(pillValue("maxIcons"), pillValue("groupByApp") === true ? 2 : 3);
+    return "Menu" + counts.map(function(count, index) {
+      var label = (pillValue("showId") === true ? String(index + 1) : "")
+        + (pillValue("showCount") === true ? raised[count] : "")
+        + (index === 0 && pillValue("showFocusedTitle") === true ? " Notes" : "");
+      var shown = icons === "all" ? Math.min(slots, count) : icons === "active" && index === 0 ? slots : 0;
+      return "   " + (label || "\u25cb") + (shown ? " " + "\u25aa".repeat(shown) : "");
+    }).join("") + (icons === "hover" ? "   (icons on hover)" : "");
   }
   function resetPreferences(): void {
     initialPreferences = Object.assign({}, savedPreferences);
@@ -118,6 +163,8 @@ Item {
     entireOpacity = savedPreferences.minimapEntireOpacity;
     overviewWindowList = savedPreferences.overviewWindowList;
     overviewDensity = savedPreferences.overviewDensity; scratchpadFollow = savedPreferences.scratchpadFollow;
+    switchOverlay = savedPreferences.switchOverlay; switcherSearchMode = savedPreferences.switcherSearchMode;
+    switcherSize = savedPreferences.switcherSize; switcherOnAllDisplays = savedPreferences.switcherOnAllDisplays;
   }
   function discard(): void {
     if (applyUnresolved) return;
@@ -270,6 +317,9 @@ Item {
       "--strip-chord", stagedStripChord, "--bar-panels", stagedBarPanels,
       "--omarchy-bar", stagedBar, "--omarchy-bar-scratchpad", stagedBarScratchpad,
       "--monitor-direction", stagedMonitorDirection, "--minimap-blur", stagedBlur];
+    // Disabling the bar item drops its pill edits; setup refuses the pair.
+    if (Object.keys(stagedPills).length && stagedBar !== "disable")
+      command.push("--omarchy-bar-pills", JSON.stringify(stagedPills));
     if (hasRuntimeDraft) {
       var selection = {}, baseline = {}, values = runtimeValues();
       Object.keys(initialPreferences).forEach(function(key) {
@@ -391,6 +441,7 @@ Item {
     stagedBarPanels = "keep";
     stagedBar = "keep";
     stagedBarScratchpad = "keep";
+    stagedPills = ({});
     stagedMonitorDirection = "keep";
     stagedMonitorOverrides = ({});
     stagedDesktopDirections = ({});
@@ -404,7 +455,7 @@ Item {
     // Opening Settings also reads previous results; they cannot consume a new draft.
     if (!applyUnresolved && hasStaged) return;
     var ownAttempt = applyUnresolved;
-    var bar = stagedBar, pill = stagedBarScratchpad;
+    var bar = stagedBar, pill = stagedBarScratchpad, pills = stagedPills;
     closeAfterSave = false;
     saveFailed = false;
     finishStaged();
@@ -413,6 +464,7 @@ Item {
     if (ownAttempt && result.manual_bar === true) {
       stagedBar = bar !== "keep" ? bar : (result.staged || {}).omarchy_bar || "keep";
       stagedBarScratchpad = pill !== "keep" ? pill : (result.staged || {}).bar_scratchpad || "keep";
+      stagedPills = Object.keys(pills).length ? pills : (result.staged || {}).bar_pills || ({});
     }
     message = "Configuration saved. Manual integration is still needed: " + (result.manual || "Review the setup instructions.");
   }
@@ -773,6 +825,7 @@ Item {
             Layout.fillWidth: true
             text: root.selectedSection === "Minimap" ? "A compact view of your desktops and windows, always within reach."
               : root.selectedSection === "Overview" ? "Browse windows across all desktops."
+              : root.selectedSection === "Switcher" ? "Choose how Alt+Tab and Desktop switching look and search."
               : root.selectedSection === "Displays" ? "Set how desktops grow on each display."
               : root.selectedSection === "Shortcuts" ? "Choose Paperland keys in Hyprland."
               : root.selectedSection === "Startup & Bar" ? "Choose how Paperland starts and appears in your desktop."
@@ -950,6 +1003,94 @@ Item {
                       checked: root.scratchpadFollow
                       Accessible.name: "Follow Scratchpad"
                       onClicked: root.scratchpadFollow = checked
+                    }
+                  }
+                }
+              }
+              Rectangle {
+                visible: root.selectedSection === "Switcher"
+                Layout.fillWidth: true; implicitHeight: 262
+                color: Theme.settingsColor("#202638"); border.color: Theme.settingsColor("#37415b"); radius: 10
+                ColumnLayout {
+                  anchors.fill: parent; anchors.margins: 20; spacing: 12
+                  Text { text: "Alt+Tab switcher"; color: Theme.settingsColor("#d9d4ff"); font.pixelSize: 18; font.bold: true }
+                  Text { text: "Applies the next time the switcher opens."; color: Theme.settingsColor("#9ea7ca"); font.pixelSize: 12 }
+                  RowLayout {
+                    Layout.fillWidth: true
+                    ColumnLayout {
+                      Text { text: "Search mode"; color: Theme.settingsColor("#c3c9e5"); font.pixelSize: 13 }
+                      Text { text: "Fuzzy matches subsequences, best first. Exact matches contiguous text."; color: Theme.settingsColor("#929cbe"); font.pixelSize: 11 }
+                    }
+                    Item { Layout.fillWidth: true }
+                    Repeater {
+                      model: Registry.KEYS.switcherSearchMode.values.map(function(value) { return [value, root.choiceLabel(value)]; })
+                      delegate: SettingsButton {
+                        id: modeButton
+                        required property var modelData
+                        objectName: "settings-switcher-mode-" + modeButton.modelData[0]
+                        text: modeButton.modelData[1]
+                        checkable: true
+                        autoExclusive: true
+                        checked: root.switcherSearchMode === modeButton.modelData[0]
+                        Accessible.name: "Search mode " + modeButton.modelData[1]
+                        onClicked: root.switcherSearchMode = modeButton.modelData[0]
+                      }
+                    }
+                  }
+                  RowLayout {
+                    Layout.fillWidth: true
+                    Text { text: "Size"; color: Theme.settingsColor("#c3c9e5"); font.pixelSize: 13 }
+                    Item { Layout.fillWidth: true }
+                    Repeater {
+                      model: Registry.KEYS.switcherSize.values.map(function(value) { return [value, root.choiceLabel(value)]; })
+                      delegate: SettingsButton {
+                        id: sizeButton
+                        required property var modelData
+                        objectName: "settings-switcher-size-" + sizeButton.modelData[0]
+                        text: sizeButton.modelData[1]
+                        checkable: true
+                        autoExclusive: true
+                        checked: root.switcherSize === sizeButton.modelData[0]
+                        Accessible.name: "Switcher size " + sizeButton.modelData[1]
+                        onClicked: root.switcherSize = sizeButton.modelData[0]
+                      }
+                    }
+                  }
+                  RowLayout {
+                    Layout.fillWidth: true
+                    ColumnLayout {
+                      Text { text: "Show on all displays"; color: Theme.settingsColor("#c3c9e5"); font.pixelSize: 13 }
+                      Text { text: "Mirror the switcher onto every display; the focused display takes the keyboard."; color: Theme.settingsColor("#929cbe"); font.pixelSize: 11 }
+                    }
+                    Item { Layout.fillWidth: true }
+                    SettingsSwitch {
+                      objectName: "settings-switcher-all-displays"
+                      checked: root.switcherOnAllDisplays
+                      Accessible.name: "Show switcher on all displays"
+                      onClicked: root.switcherOnAllDisplays = checked
+                    }
+                  }
+                }
+              }
+              Rectangle {
+                visible: root.selectedSection === "Switcher"
+                Layout.fillWidth: true; implicitHeight: 128
+                color: Theme.settingsColor("#202638"); border.color: Theme.settingsColor("#37415b"); radius: 10
+                ColumnLayout {
+                  anchors.fill: parent; anchors.margins: 20; spacing: 12
+                  Text { text: "Desktop switch card"; color: Theme.settingsColor("#d9d4ff"); font.pixelSize: 18; font.bold: true }
+                  RowLayout {
+                    Layout.fillWidth: true
+                    ColumnLayout {
+                      Text { text: "Show Desktop number on switch"; color: Theme.settingsColor("#c3c9e5"); font.pixelSize: 13 }
+                      Text { text: "Briefly show a card with the Desktop number and name each time you switch."; color: Theme.settingsColor("#929cbe"); font.pixelSize: 11 }
+                    }
+                    Item { Layout.fillWidth: true }
+                    SettingsSwitch {
+                      objectName: "settings-switch-overlay"
+                      checked: root.switchOverlay
+                      Accessible.name: "Show Desktop number on switch"
+                      onClicked: root.switchOverlay = checked
                     }
                   }
                 }
@@ -1179,6 +1320,74 @@ Item {
                 }
               }
               Rectangle {
+                visible: root.selectedSection === "Startup & Bar"
+                Layout.fillWidth: true; implicitHeight: pillsColumn.implicitHeight + 40
+                color: Theme.settingsColor("#202638"); border.color: Theme.settingsColor("#37415b"); radius: 10
+                ColumnLayout {
+                  id: pillsColumn
+                  anchors { left: parent.left; right: parent.right; top: parent.top; margins: 20 }
+                  spacing: 12
+                  Text { text: "Workspace pills"; color: Theme.settingsColor("#d9d4ff"); font.pixelSize: 18; font.bold: true }
+                  Text { text: root.pillsEditable ? "How Paperland's Omarchy Bar pills show each workspace. Saved to json.paperland in shell.json; the bar updates without a restart." : "Use Paperland in Omarchy Bar to configure its workspace pills."; color: Theme.settingsColor("#9ea7ca"); font.pixelSize: 12; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                  Repeater {
+                    model: [
+                      {key: "showId", label: "Show workspace number", name: "settings-pill-show-id"},
+                      {key: "showCount", label: "Show window count", name: "settings-pill-show-count"},
+                      {key: "showName", label: "Show workspace name", name: "settings-pill-show-name"},
+                      {key: "showFocusedTitle", label: "Show focused window title", name: "settings-pill-show-title"},
+                      {key: "showIcons", label: "Show app icons", name: "settings-pill-show-icons"},
+                      {key: "groupByApp", label: "Group icons by app", name: "settings-pill-group-by-app"}
+                    ]
+                    delegate: RowLayout {
+                      id: pillSwitchRow
+                      required property var modelData
+                      Layout.fillWidth: true
+                      Text { text: pillSwitchRow.modelData.label; color: Theme.settingsColor("#c3c9e5"); font.pixelSize: 13 }
+                      Item { Layout.fillWidth: true }
+                      SettingsSwitch {
+                        objectName: pillSwitchRow.modelData.name
+                        enabled: root.pillsEditable
+                        checked: root.pillValue(pillSwitchRow.modelData.key) === true
+                        Accessible.name: pillSwitchRow.modelData.label
+                        onClicked: root.stagePill(pillSwitchRow.modelData.key, checked)
+                      }
+                    }
+                  }
+                  Repeater {
+                    model: [
+                      {key: "iconsOn", label: "Show icons on", name: "settings-pill-icons-on",
+                       values: ["active", "all", "hover"], labels: ["Active pill", "All pills", "Hovered pill"]},
+                      {key: "maxIcons", label: "Icon slots", name: "settings-pill-max-icons",
+                       values: [1, 2, 3, 4, 5, 6, 7, 8], labels: ["1", "2", "3", "4", "5", "6", "7", "8"]},
+                      {key: "iconStyle", label: "Icon style", name: "settings-pill-icon-style",
+                       values: ["color", "mono"], labels: ["Color", "Mono"]}
+                    ]
+                    delegate: RowLayout {
+                      id: pillChoiceRow
+                      required property var modelData
+                      Layout.fillWidth: true
+                      Text { text: pillChoiceRow.modelData.label; color: Theme.settingsColor("#c3c9e5"); font.pixelSize: 13 }
+                      Item { Layout.fillWidth: true }
+                      QQC.ComboBox {
+                        objectName: pillChoiceRow.modelData.name
+                        Layout.preferredWidth: 210
+                        implicitHeight: 38
+                        enabled: root.pillsEditable
+                        model: pillChoiceRow.modelData.labels
+                        currentIndex: pillChoiceRow.modelData.values.indexOf(root.pillValue(pillChoiceRow.modelData.key))
+                        Accessible.name: pillChoiceRow.modelData.label
+                        palette.base: Theme.settingsColor("#1b2234")
+                        palette.button: Theme.settingsColor("#1b2234")
+                        palette.text: Theme.settingsColor("#d5ddf5")
+                        palette.buttonText: Theme.settingsColor("#d5ddf5")
+                        background: Rectangle { radius: 7; color: Theme.settingsColor("#1b2234"); border.color: Theme.settingsColor("#414c69") }
+                        onActivated: root.stagePill(pillChoiceRow.modelData.key, pillChoiceRow.modelData.values[currentIndex])
+                      }
+                    }
+                  }
+                }
+              }
+              Rectangle {
                 visible: root.selectedSection === "Displays"
                 Layout.fillWidth: true; implicitHeight: 105
                 color: Theme.settingsColor("#202638"); border.color: Theme.settingsColor("#37415b"); radius: 10
@@ -1299,7 +1508,7 @@ Item {
             }
           }
           Rectangle {
-            visible: card.width >= 1050
+            visible: card.width >= 1050 && root.selectedSection !== "Switcher"
             Layout.preferredWidth: card.width * 0.31
             Layout.fillHeight: true
             radius: 10
@@ -1318,8 +1527,14 @@ Item {
                   GradientStop { position: 1; color: Theme.settingsColor("#111e34") }
                 }
                 MiniStrip {
+                  id: settingsMinimap
                   visible: root.selectedSection === "Minimap"
                   enabled: false
+                  // Live previews report like the real surfaces, only while
+                  // Settings shows them (captureEnabled gates their records).
+                  captureSurface: "settings-minimap"
+                  Component.onCompleted: Native.Runtime.registerCaptureSurface(settingsMinimap)
+                  Component.onDestruction: Native.Runtime.unregisterCaptureSurface(settingsMinimap)
                   row: root.targetScreen ? root.service.rowForScreen(root.targetScreen.name) : null
                   width: vertical ? 150 : parent.width - 24
                   height: vertical ? Math.min(parent.height - 24, implicitHeight) : implicitHeight
@@ -1331,6 +1546,8 @@ Item {
                   scratchpad: root.targetScreen ? root.service.scratchpadForMonitor(root.targetScreen.name) : null
                   scratchpadOpen: !!scratchpad && scratchpad.active
                   shortcutBinding: root.service.scratchpadBinding
+                  urgentAddresses: root.service.urgentAddresses
+                  urgentByWorkspace: root.service.urgentByWorkspace
                   focusedAddress: root.service.focusedAddress
                   pinned: root.pinned
                   peek: root.peekEnabled
@@ -1340,8 +1557,12 @@ Item {
                   nameFor: Native.Runtime.nameFor
                 }
                 OverviewBoard {
+                  id: settingsOverview
                   visible: root.selectedSection === "Overview"
                   enabled: false
+                  captureSurface: "settings-overview"
+                  Component.onCompleted: Native.Runtime.registerCaptureSurface(settingsOverview)
+                  Component.onDestruction: Native.Runtime.unregisterCaptureSurface(settingsOverview)
                   width: 1100
                   height: parent.height / scale
                   scale: parent.width / width
@@ -1351,6 +1572,7 @@ Item {
                   windows: root.service.windows
                   catalog: root.service.catalog
                   focusedAddress: root.service.focusedAddress
+                  urgentAddresses: root.service.urgentAddresses
                   captureEnabled: root.opened && visible
                   listEnabled: root.overviewWindowList
                   density: root.overviewDensity
@@ -1377,7 +1599,7 @@ Item {
                     radius: 6; color: Theme.settingsColor("#111b31")
                     Text {
                       anchors.centerIn: parent
-                      text: !root.currentSetup.bar_available ? "Omarchy Bar unavailable" : "Menu    1   2   3" + ((root.stagedBar === "enable" || root.stagedBar === "keep" && root.currentSetup.omarchy_bar === true) && (root.stagedBarScratchpad === "show" || root.stagedBarScratchpad === "keep" && root.currentSetup.bar_scratchpad !== false) ? "     S" : "")
+                      text: !root.currentSetup.bar_available ? "Omarchy Bar unavailable" : root.barPreview() + ((root.stagedBar === "enable" || root.stagedBar === "keep" && root.currentSetup.omarchy_bar === true) && (root.stagedBarScratchpad === "show" || root.stagedBarScratchpad === "keep" && root.currentSetup.bar_scratchpad !== false) ? "     S" : "")
                       color: Theme.settingsColor("#c5d2f4"); font.pixelSize: 12
                     }
                   }

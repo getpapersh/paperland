@@ -29,6 +29,19 @@ Item {
   readonly property bool hasContent: loader.item ? (loader.item as ThumbnailContent).hasContent : false
   readonly property bool cached: loader.item ? (loader.item as ThumbnailContent).cached : false
   readonly property real aspectRatio: loader.item ? (loader.item as ThumbnailContent).aspectRatio : 0
+  // Capture-health snapshot for the diagnostics report, read at request time
+  // through the host's own bindings.
+  readonly property var captureReport: ({
+    onScreen: visible && width > 0 && height > 0,
+    capturing: loader.item ? (loader.item as ThumbnailContent).captureActive : false,
+    intersectsViewport: intersectsViewport,
+    captureEnabled: captureEnabled,
+    live: hasContent && !cached,
+    cached: cached,
+    capturedAt: loader.item ? (loader.item as ThumbnailContent).capturedAt : 0,
+    renderable: loader.item ? (loader.item as ThumbnailContent).renderable : true,
+    stopped: loader.item ? (loader.item as ThumbnailContent).stopped : false
+  })
   readonly property double capturedAt: loader.item ? (loader.item as ThumbnailContent).capturedAt : 0
   clip: true
   Shape {

@@ -19,9 +19,30 @@ var KEYS = {
   "minimapEntireOpacity": { "type": "int", "default": 100, "min": 20, "max": 100 },
   "overviewWindowList": { "type": "bool", "default": true },
   "overviewDensity": { "type": "int", "default": 0, "min": 0, "max": 2 },
-  "scratchpadFollow": { "type": "bool", "default": true }
+  "scratchpadFollow": { "type": "bool", "default": true },
+  "switchOverlay": { "type": "bool", "default": true },
+  "switcherSearchMode": { "type": "choice", "default": "fuzzy", "values": ["fuzzy", "exact"] },
+  "switcherSize": { "type": "choice", "default": "large", "values": ["small", "medium", "large", "xl"] },
+  "switcherOnAllDisplays": { "type": "bool", "default": false }
 };
 // END registry
+
+/**
+ * Entries settings.ini keeps that `paperland config` does not list: upgrade, welcome and What's
+ * News markers, and descriptive direction notes. The shared writer validates them against this
+ * block. "json" values are stored as one JSON text. autoHideSeconds is the pre-Peek delay: read by
+ * the upgrade, never written.
+ * @type {Object<string, {type: "bool"|"int"|"string"|"json", default: (boolean|number|string)}>}
+ */
+// BEGIN internal
+var INTERNAL = {
+  "settingsVersion": { "type": "int", "default": 0 },
+  "autoHideSeconds": { "type": "int", "default": 0 },
+  "welcomeShown": { "type": "bool", "default": false },
+  "whatsNewLastSeenVersion": { "type": "string", "default": "" },
+  "workspaceDirections": { "type": "json", "default": "{}" }
+};
+// END internal
 
 /** @returns {string} the allowed values of a known key, for error messages. */
 function describe(key) {
@@ -75,7 +96,7 @@ function snapshot(source) {
 }
 
 /**
- * Reads every key through `get(key, fallback)`, as Settings.value does, keeping invalid
+ * Reads every key through `get(key, fallback)`, where fallback is the registry default, keeping invalid
  * saved entries out of the result and reporting them instead. `current` holds the live
  * values that a rejected entry leaves in place, so the resulting pin/Peek pair is checked.
  * @returns {{values: Object<string, *>, errors: Array<{key: string, detail: string}>}}
@@ -99,23 +120,37 @@ function read(get, current) {
   return { values: values, errors: errors };
 }
 
-/**
- * Assigns values to a QtCore Settings object and writes them through before returning.
- * Settings delays property writes by 500 ms and sync() does not flush them, so without
- * setValue an immediate reload would reread the old file and undo an acknowledged change.
- */
+/** Assigns validated values to the shell's settings holder. */
 function apply(store, values) {
-  for (var key in values) {
-    store[key] = values[key];
-    store.setValue(key, values[key]);
-  }
-  store.sync();
+  for (var key in values) store[key] = values[key];
 }
 
-/** Rereads the file into a Settings object; invalid entries keep the live value. */
-function reload(store) {
-  store.sync();
-  var result = read(function(key, fallback) { return store.value(key, fallback); }, store);
-  apply(store, result.values);
-  return result;
+/**
+ * Reads the INTERNAL entries through `get(key)`, which returns the file's text (or a decoded
+ * object for a legacy map); an absent or unreadable entry gives its default.
+ * @returns {Object<string, *>} a value for every INTERNAL key; workspaceDirections as an object.
+ */
+function readInternal(get) {
+  var values = {};
+  for (var key in INTERNAL) {
+    var spec = INTERNAL[key], raw = get(key), value = spec.default;
+    if (raw !== undefined) {
+      if (spec.type === "bool") { if (raw === "true" || raw === "false") value = raw === "true"; }
+      else if (spec.type === "int") { if (/^-?[0-9]+$/.test(raw)) value = Number(raw); }
+      else if (spec.type === "string") { if (typeof raw === "string") value = raw; }
+      else value = parseMap(raw);
+    }
+    values[key] = spec.type === "json" && typeof value === "string" ? parseMap(value) : value;
+  }
+  return values;
+}
+
+/** @returns {Object<string, string>} a map of strings from JSON text or an already decoded object; {} otherwise. */
+function parseMap(raw) {
+  try {
+    var map = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (map === null || typeof map !== "object" || Array.isArray(map)) return {};
+    for (var key in map) if (typeof map[key] !== "string") return {};
+    return map;
+  } catch (error) { return {}; }
 }

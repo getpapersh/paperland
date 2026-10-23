@@ -427,12 +427,17 @@ Item {
               readonly property var window: root.windows[modelData] || ({app: "", title: "", monitor: "", workspaceId: 0, workspaceName: ""})
               readonly property bool isWorkspace: modelData.indexOf("ws:") === 0
               readonly property var entry: isWorkspace ? root.service.catalog.entries[Number(modelData.slice(3))] || null : null
+              // Marks come from the service snapshot; the excluded address is the
+              // actually focused window, never this grid's selection.
+              readonly property bool urgent: modelData !== root.service.focusedAddress
+                && !!root.service.urgentAddresses[modelData]
               readonly property var imageSize: root.imageSize(modelData, surface.width)
               objectName: "switcher-card-" + index
               width: grid.cellWidth - 8; height: grid.cellHeight - 8
               focusPolicy: Qt.NoFocus
               Accessible.name: entry ? Catalog.accessibleName(entry)
                 : Native.Runtime.nameFor(window.app) + ", " + window.title + ", " + Logic.location(window).split(" · ").join(", ")
+                + (urgent ? ", needs attention" : "")
               onClicked: root.choose(modelData)
               TapHandler { acceptedButtons: Qt.RightButton; enabled: !tile.isWorkspace; onTapped: eventPoint => Native.Runtime.sendMenu.openFor(tile.modelData, popup.modelData, tile.mapToItem(null, eventPoint.position.x, eventPoint.position.y)) }
               background: Rectangle {
@@ -470,7 +475,7 @@ Item {
                   x: 4; y: 4; width: parent.width - 8; spacing: 2
                   Item {
                     width: parent.width; height: Math.max(nameText.implicitHeight, naming.visible ? naming.height : 0)
-                    Text { id: nameText; width: parent.width - (naming.visible ? naming.width + 6 : 0); anchors.verticalCenter: parent.verticalCenter; text: tile.entry ? root.workspaceLabel(tile.entry) : Native.Runtime.nameFor(tile.window.app); textFormat: Text.PlainText; elide: Text.ElideRight; color: Theme.switcherTextPrimary; font.bold: true; font.pixelSize: 13 }
+                    Text { id: nameText; width: parent.width - (naming.visible ? naming.width + 6 : 0) - (tile.urgent ? 12 : 0); anchors.verticalCenter: parent.verticalCenter; text: tile.entry ? root.workspaceLabel(tile.entry) : Native.Runtime.nameFor(tile.window.app); textFormat: Text.PlainText; elide: Text.ElideRight; color: Theme.switcherTextPrimary; font.bold: true; font.pixelSize: 13 }
                     // PaperMac's Desktop header actions: rename, and clear when a custom name is set.
                     Row {
                       id: naming
@@ -500,6 +505,13 @@ Item {
                   }
                   Text { width: parent.width; text: tile.entry ? (tile.entry.count === null ? "Desktop" : tile.entry.count + (tile.entry.count === 1 ? " window" : " windows")) : tile.window.title; textFormat: Text.PlainText; elide: Text.ElideRight; color: Theme.switcherTextSecondary; font.pixelSize: 12 }
                   Text { objectName: "switcher-location-" + tile.index; width: parent.width; text: tile.entry ? tile.entry.monitor + (tile.entry.active ? " · Current" : "") : Logic.location(tile.window); textFormat: Text.PlainText; elide: Text.ElideRight; color: Theme.switcherTextTertiary; font.pixelSize: 11 }
+                }
+                // Declared after the identity column so the texts cannot paint
+                // over the mark.
+                Shared.UrgentDot {
+                  objectName: "switcher-urgent-" + tile.index
+                  anchors { right: parent.right; top: parent.top; margins: 3 }
+                  visible: tile.urgent
                 }
               }
             }

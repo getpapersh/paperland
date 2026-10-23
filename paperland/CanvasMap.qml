@@ -4,6 +4,7 @@ import QtQuick.Controls as QQC
 import "Layout.js" as Layout
 import "shared/PreviewGeometry.js" as PreviewGeometry
 import "shared" as Shared
+import "shared/CaptureReport.js" as CaptureReport
 
 Item {
   id: root
@@ -71,6 +72,12 @@ Item {
   property var nameFor: function(app) { return Layout.appName(app); }
   property var addresses: []
   property var badgeAddresses: []
+  // { [address]: true } for windows that requested attention. The focused
+  // window is never marked, whatever the snapshot still contains.
+  property var urgentAddresses: ({})
+  function isUrgent(address: string): bool {
+    return address !== root.focusedAddress && !!root.urgentAddresses[address];
+  }
   function syncAddresses(): void {
     var next = row ? row.windows.map(function(w) { return w.address; }) : [];
     if (JSON.stringify(next) !== JSON.stringify(addresses)) {
@@ -83,6 +90,10 @@ Item {
   property var row: null
   property string focusedAddress: ""
   property string selectedAddress: ""
+  // Cross-highlight from outside the map (bar pill icon hover). Unlike
+  // selectedAddress it never reveals/pans the map, and unlike hoveredAddress
+  // it is not written by the map's own pointer handling.
+  property string highlightAddress: ""
   property string query: ""
   property bool live: false
   property bool externalControl: false
@@ -95,12 +106,13 @@ Item {
   property color accent: "cyan"
   signal activated(string address)
   function menuAnchor(address: string): point {
-    var window = root.row ? root.row.windows.find(function(w) { return w.address === address; }) : null;
-    if (window) {
-      var r = canvas.rect(window.rect);
-      var left = Math.max(r.x, flick.contentX), top = Math.max(r.y, flick.contentY);
-      var right = Math.min(r.x + r.width, flick.contentX + flick.width);
-      var bottom = Math.min(r.y + r.height, flick.contentY + flick.height);
+    // Anchor to the drawn card: lane cards stretch to the lane height, so the
+    // window's proportional canvas rect is no longer where the card appears.
+    var card = cards.itemAt(root.addresses.indexOf(address));
+    if (card) {
+      var left = Math.max(card.x, flick.contentX), top = Math.max(card.y, flick.contentY);
+      var right = Math.min(card.x + card.width, flick.contentX + flick.width);
+      var bottom = Math.min(card.y + card.height, flick.contentY + flick.height);
       if (right > left && bottom > top) return flick.contentItem.mapToItem(null, left, top);
     }
     return root.mapToItem(null, width / 2, height / 2);
@@ -110,6 +122,26 @@ Item {
   signal hovered(string address)
 
   function repaint() { canvas.requestPaint(); }
+  // Capture-report records for this map's actual card slots; see MiniStrip.
+  function captureRecords(surface: string): var {
+    var records = [];
+    for (var i = 0; i < root.addresses.length; i++) {
+      var address = root.addresses[i];
+      var window = root.row ? root.row.windows.find(function(w) { return w.address === address; }) : null;
+      var record = CaptureReport.slotRecord(surface, root.row, true, i, window, cardSlot(i));
+      if (record) records.push(record);
+    }
+    return records;
+  }
+  function cardSlot(index: int): Shared.ThumbnailSlot {
+    var card = cards.itemAt(index);
+    if (!card) return null;
+    for (var i = 0; i < card.children.length; i++) {
+      var slot = card.children[i] as Shared.ThumbnailSlot;
+      if (slot) return slot;
+    }
+    return null;
+  }
   function fit() { revealAddress = ""; zoom = 1; flick.contentX = 0; flick.contentY = 0; }
   function currentView() {
     revealAddress = "";
@@ -165,6 +197,7 @@ Item {
   Component.onCompleted: syncAddresses()
   onFocusedAddressChanged: repaint()
   onSelectedAddressChanged: repaint()
+  onHighlightAddressChanged: repaint()
   onQueryChanged: repaint()
   onHoveredAddressChanged: { repaint(); hovered(hoveredAddress); }
   onForegroundChanged: repaint()
@@ -205,6 +238,7 @@ Item {
     interactive: false
     clip: true
     Repeater {
+      id: cards
       model: root.addresses
       delegate: Item {
         id: imageCard
@@ -217,7 +251,12 @@ Item {
         readonly property bool selected: modelData === root.selectedAddress
         readonly property bool focused: modelData === root.focusedAddress
         readonly property bool hot: selected || modelData === root.hoveredAddress
+          || modelData === root.highlightAddress
+        // A pill-driven cross-highlight uses the selection ring: a 1 px 0.40
+        // border measures 1.38:1 against neighbouring cards, too faint to find.
+        readonly property bool highlighted: modelData === root.highlightAddress
         readonly property int badgeNumber: root.badgeAddresses.indexOf(modelData) + 1
+        readonly property bool urgent: root.isUrgent(modelData)
         objectName: "map-card-" + modelData
         x: box.x; y: root.row && root.row.vertical ? box.y : root.padY
         width: root.row && root.row.vertical ? Math.max(0, flick.width - root.padX * 2) : box.width
@@ -228,7 +267,8 @@ Item {
         Accessible.role: Accessible.Button
         Accessible.selected: modelData === root.selectedAddress
         Accessible.name: window ? root.nameFor(window.app) + ", " + window.title
-          + (badgeNumber > 0 && badgeNumber <= 9 ? ", number " + badgeNumber : "") : ""
+          + (badgeNumber > 0 && badgeNumber <= 9 ? ", number " + badgeNumber : "")
+          + (urgent ? ", needs attention" : "") : ""
         Accessible.onPressAction: root.activated(modelData)
         Rectangle {
           anchors.fill: parent
@@ -237,7 +277,7 @@ Item {
           color: "transparent"
           border.color: root.accent
           border.width: 2
-          visible: imageCard.selected
+          visible: imageCard.selected || imageCard.highlighted
         }
         Rectangle {
           anchors.fill: parent
@@ -287,6 +327,13 @@ Item {
             anchors.leftMargin: 8
             anchors.rightMargin: 8
             spacing: 5
+            // Room for the attention mark (drawn above the card by the dot
+            // repeater below) so it never covers the icon or the title.
+            Item {
+              visible: imageCard.urgent
+              anchors.verticalCenter: parent.verticalCenter
+              width: 8; height: 8
+            }
             Rectangle {
               visible: imageCard.focused
               anchors.verticalCenter: parent.verticalCenter
@@ -303,6 +350,7 @@ Item {
               fillMode: Image.PreserveAspectFit
             }
             Text {
+              objectName: "map-header-name-" + imageCard.modelData
               anchors.verticalCenter: parent.verticalCenter
               text: imageCard.window ? root.nameFor(imageCard.window.app) : ""
               textFormat: Text.PlainText
@@ -361,6 +409,9 @@ Item {
       // The visible viewport in canvas coordinates; card badges and the vector fallback use it.
       readonly property var viewRect: root.row ? rect(root.row.viewport) : ({x: 0, y: 0, width: 0, height: 0})
       function rect(r) {
+        // A delegate can re-evaluate its box before its window, while the row is
+        // being replaced or cleared; answer an empty rect instead of throwing.
+        if (!root.row || !r) return { x: 0, y: 0, width: 0, height: 0 };
         return { x: root.spacious ? root.padX + (r.x - root.row.bounds.x) * sx : pad + (r.x - root.row.bounds.x) * sx,
           y: root.spacious ? root.padY + (r.y - root.row.bounds.y) * sy : pad + (r.y - root.row.bounds.y) * sy,
           width: r.width * sx, height: r.height * sy };
@@ -388,7 +439,8 @@ Item {
         if (!root.thumbnailSource.toString()) ordered.forEach(function(w) {
           var r = rect(w.rect);
           var focused = w.address === root.focusedAddress;
-          var hot = w.address === root.hoveredAddress || w.address === root.selectedAddress;
+          var hot = w.address === root.hoveredAddress || w.address === root.selectedAddress
+            || w.address === root.highlightAddress;
           box(ctx, r, hot ? Theme.surfaceSelected : (w.inView ? Theme.surfaceControl : Theme.surfaceStrip),
             Theme.alpha(root.foreground, hot ? 0.40 : 0.22), 1);
           if (r.width > 44 && r.height > 26) {
@@ -481,6 +533,38 @@ Item {
         number: index + 1
       }
     }
+  Repeater {
+    // One mark per window address, hidden by state: probes and tests need the
+    // item to exist with a visible flag, exactly like the strip's card dots.
+    model: root.addresses
+    delegate: Shared.UrgentDot {
+      id: urgentDot
+      required property string modelData
+      readonly property var window: root.row
+        ? root.row.windows.find(function(w) { return w.address === urgentDot.modelData; }) : null
+      readonly property var box: window ? canvas.rect(window.rect) : ({ x: 0, y: 0, width: 0, height: 0 })
+      objectName: "map-urgent-" + modelData
+      // Above the bitmap and the cards, beside the badges: the mark survives
+      // both the live-thumbnail and the vector fallback, at every density.
+      // Thumbnail cards draw their 24 px header at padY (landscape) or box.y
+      // (vertical); a card tall enough for the header gets the mark in the
+      // header's reserved slot before the icon, a shorter one a corner dot.
+      // The vector fallback has no header and draws at box.y.
+      readonly property bool thumbnails: root.thumbnailSource.toString() !== ""
+      readonly property real cardTop: thumbnails && !(root.row && root.row.vertical) ? root.padY : box.y
+      readonly property real cardHeight: root.row && root.row.vertical ? box.height
+        : Math.max(0, flick.height - root.padY * 2)
+      readonly property bool inHeader: thumbnails && cardHeight >= 64
+      x: box.x + (inHeader ? 8 : 4)
+      y: cardTop + (inHeader ? 8 : 4)
+      z: 2.5
+      visible: !!window && root.isUrgent(modelData)
+      // The vector fallback paints no accessible card, so the dot speaks
+      // there and only there; thumbnail mode's card carries the suffix.
+      accessName: root.thumbnailSource.toString() !== "" || !window || !root.isUrgent(modelData) ? ""
+        : root.nameFor(window.app) + ", " + window.title + ", needs attention"
+    }
+  }
     Item {
       // Input coordinates remain in world-content space while the bitmap follows the viewport.
       z: 3

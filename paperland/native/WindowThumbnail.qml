@@ -17,7 +17,8 @@ Shared.ThumbnailContent {
   readonly property var cacheEntry: Runtime.thumbnails.entry(address, handle)
   readonly property bool liveContent: capture.item ? (capture.item as Shared.ThumbnailContent).hasContent : false
   property var sampleToken: null
-  readonly property bool renderable: {
+  // Binds the shared renderable flag to the compositor's export eligibility.
+  renderable: {
     if (!snapshot || !snapshot.at || !snapshot.size) return false;
     var monitor = Hyprland.monitors.values.find(function(m) { return m.lastIpcObject.id === root.snapshot.monitor; });
     if (!monitor) return false;
@@ -26,6 +27,8 @@ Shared.ThumbnailContent {
     return Layout.intersects({x: snapshot.at[0], y: snapshot.at[1], width: snapshot.size[0], height: snapshot.size[1]}, Layout.monitorRect(monitor.lastIpcObject));
   }
   onRenderableChanged: restart()
+  // An actual or scheduled capture; a retained image alone is not one.
+  captureActive: capture.active || restartTimer.running
   hasContent: liveContent || cached
   cached: !liveContent && cachedImage.status === Image.Ready
   capturedAt: cacheEntry ? cacheEntry.capturedAt : 0
@@ -47,7 +50,10 @@ Shared.ThumbnailContent {
     id: restartTimer
     interval: 0
     // A pending restart must die with its thumbnail's QML creation context.
-    onTriggered: capture.active = !!root.handle && root.renderable
+    onTriggered: {
+      root.stopped = false;
+      capture.active = !!root.handle && root.renderable;
+    }
   }
   Loader {
     id: capture
@@ -90,6 +96,10 @@ Shared.ThumbnailContent {
           onTriggered: view.sample()
         }
         onStopped: {
+          // The stop flag lives on this item, not the capture loader's
+          // content: deactivation destroys that content immediately. Restart
+          // clears it when a new capture attempt begins.
+          root.stopped = true;
           Runtime.thumbnails.invalidate(root.address, root.handle);
           root.cancelSample();
           capture.active = false;

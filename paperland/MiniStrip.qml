@@ -4,13 +4,17 @@ import QtQuick
 import QtQuick.Controls as QQC
 import "Layout.js" as CanvasLayout
 import "MiniLayout.js" as MiniLayout
+import "shared/Urgency.js" as Urgency
 import "shared/PreviewGeometry.js" as PreviewGeometry
 import "shared" as Shared
+import "shared/CaptureReport.js" as CaptureReport
 
 Rectangle {
   id: root
   property url thumbnailSource
   property bool captureEnabled: false
+  // The capture report's surface name; Settings' preview strip names its own.
+  property string captureSurface: "minimap"
   property var row: null
   property var workspaces: []
   property var remoteWorkspaces: []
@@ -22,6 +26,13 @@ Rectangle {
   property bool scratchpadOpen: false
   property var addresses: []
   property var badgeAddresses: []
+  // { [address]: true } for windows that requested attention. Focused
+  // exclusion happens per card: the spec requires the focused window to be
+  // unmarked, whatever the snapshot still contains.
+  property var urgentAddresses: ({})
+  // { [workspaceId]: true } for pills; computed once in Service from the
+  // catalog identities these tabs also carry.
+  property var urgentByWorkspace: ({})
   property int hitMonitorId: -1
   property real hitMonitorX: 0
   property real hitMonitorY: 0
@@ -247,6 +258,14 @@ Rectangle {
   // windows have no column and are shown as chips instead.
   readonly property var stripRow: CanvasLayout.tiledRow(row)
   readonly property var floats: row ? row.windows.filter(function(w) { return CanvasLayout.isFloating(w); }) : []
+  // The shared Scratchpad entry is global; a client in it that requested
+  // attention marks every display's pill, open or closed, on every display.
+  readonly property bool scratchpadUrgent: !!scratchpad && scratchpad.windows.some(function(window) {
+    return window.address !== focusedAddress && !!urgentAddresses[window.address];
+  })
+  // Per-side parked counts for the displayed row; physical sides, all four
+  // directions. Pure geometry from the established row snapshot.
+  readonly property var parkedUrgent: Urgency.parkedCounts(stripRow, urgentAddresses, focusedAddress)
   // "group": the full Floating group in the header. "count": condensed to one
   // chip in a tab above the controls, so the pills never lose width to floats.
   // "rail": a portrait rail's row below its strip.
@@ -367,6 +386,25 @@ Rectangle {
     if (selectedAddresses.indexOf(selectionAnchor) < 0) selectionAnchor = selectedAddresses.length ? selectedAddresses[selectedAddresses.length - 1] : "";
   }
   Component.onCompleted: { syncTabs(); syncWindows(); }
+  // Capture-report records for this strip's actual slot items, with the row
+  // context the slots themselves cannot know. A card whose slot or window has
+  // gone reports nothing rather than a guess. Hosts register the strip in the
+  // runtime's capture-surface registry; the strip itself stays runtime-free.
+  function captureRecords(): var {
+    // A hidden strip, or one suspended by the overview or a dialog, shows no
+    // slots; its host disables capture exactly then.
+    if (!root.captureEnabled) return [];
+    var records = [];
+    for (var i = 0; i < root.addresses.length; i++) {
+      var record = CaptureReport.slotRecord(root.captureSurface, root.row, true, i, root.windowFor(root.addresses[i]), cardSlot(i));
+      if (record) records.push(record);
+    }
+    return records;
+  }
+  function cardSlot(index: int): Shared.ThumbnailSlot {
+    var card = cardRepeater.itemAt(index);
+    return card ? card.thumbnailSlot : null;
+  }
   function syncTabs() {
     if (JSON.stringify(tabs) !== JSON.stringify(workspaces)) tabs = workspaces;
   }
@@ -427,6 +465,7 @@ Rectangle {
             height: 18
             radius: height / 2
             readonly property bool fadedForScratchpad: modelData.active && root.scratchpadOpen
+            readonly property bool urgent: !!root.urgentByWorkspace[modelData.id]
             opacity: fadedForScratchpad ? 0.55 : 1
             color: root.draggingSelection && root.dragWorkspace === modelData.id && root.splitWarning !== "" ? "#654825"
               : modelData.active ? root.accent : modelData.count ? "#414141" : "transparent"
@@ -434,10 +473,21 @@ Rectangle {
               : root.draggingSelection && root.dragWorkspace === modelData.id ? root.accent
               : modelData.active ? "#bb83c0" : "#565656"
             border.width: root.draggingSelection && root.dragWorkspace === modelData.id ? 2 : fadedForScratchpad ? 0 : 1
-            clip: true
             Accessible.role: Accessible.Button
-            Accessible.name: pillLabel.accessibleName
+            Accessible.name: pillLabel.accessibleName + (urgent ? ", needs attention" : "")
             Accessible.onPressAction: root.workspaceActivated(modelData.id)
+            Shared.UrgentDot {
+              // A badge on the pill's top-right corner, clear of the raised
+              // count without widening the pill. Landscape pills overhang into
+              // the row spacing; the rail's full-width pills would be clipped
+              // there, so they keep the badge inside their edge.
+              objectName: "mini-pill-urgent-" + pill.modelData.id
+              x: parent.width - (root.vertical ? width : 4)
+              y: 0
+              z: 5
+              diameter: 6
+              visible: pill.urgent
+            }
             Shared.WorkspaceLabel {
               id: pillLabel
               x: 7; anchors.verticalCenter: parent.verticalCenter
@@ -470,6 +520,8 @@ Rectangle {
           entry: root.scratchpad
           shortcutBinding: root.shortcutBinding
           open: root.scratchpadOpen
+          urgent: root.scratchpadUrgent
+          badgeInside: root.vertical
           showName: !root.vertical
           pillEnabled: !root.vertical || !root.collapsed || root.scratchpadOpen
           width: root.vertical ? workspaceScroll.width : implicitWidth
@@ -738,7 +790,7 @@ Rectangle {
     Repeater {
       id: cardRepeater
       model: root.addresses
-      delegate: Rectangle {
+      delegate: Item {
         id: card
         required property string modelData
         readonly property var window: root.windowFor(modelData)
@@ -748,15 +800,16 @@ Rectangle {
         readonly property bool selected: root.selectedInOrder().indexOf(modelData) >= 0
         readonly property int selectedIndex: root.selectedInOrder().indexOf(modelData)
         readonly property int badgeNumber: root.badgeAddresses.indexOf(modelData) + 1
+        // Urgent and unfocused. The dot stays on dimmed offscreen cards; only
+        // real focus clears it.
+        readonly property bool urgent: !focused && !!root.urgentAddresses[modelData]
         // Where a release would land. Accent at reduced opacity reads as "not
         // yet focused" without inventing a second colour for a transient state.
         readonly property bool landing: !focused && modelData === root.pendingLanding
-        readonly property real priorCaptionWidth: Math.max(0, width - (icon.source.toString() ? 34 : 10) - 9)
-        // Preserve any caption that fit before; already elided text keeps a
-        // useful reading area instead of surrendering it to the thumbnail.
-        readonly property real captionNeeded: Math.max(
-          appName.implicitWidth <= priorCaptionWidth ? appName.implicitWidth : Math.min(120, priorCaptionWidth),
-          height >= 36 ? (windowTitle.implicitWidth <= priorCaptionWidth ? windowTitle.implicitWidth : Math.min(120, priorCaptionWidth)) : 0)
+        // Tests read the face's fill through the delegate.
+        property alias color: cardFace.color
+        // The report reads the slot through this alias, not the item tree.
+        property alias thumbnailSlot: thumbnail
         objectName: "mini-window-" + modelData
         x: selected && root.draggingSelection
           ? Math.max(0, Math.min(strip.width - width, root.dragStart.x + root.dragDeltaX - strip.x + 14 + selectedIndex * 14))
@@ -768,12 +821,30 @@ Rectangle {
           : root.vertical ? cross.size : box.size
         height: root.vertical ? box.size : cross.size
         z: selected && root.draggingSelection ? 20 + selectedIndex : focused ? 2 : 1
-        radius: 5
-        clip: true
-        opacity: landing ? 0.6 : window && !window.inView && !focused ? 0.48 : 1
-        color: focused || landing ? root.accent : cardMouse.containsMouse ? "#505050" : "#3d3d3d"
-        border.color: focused || landing ? "#be89c3" : "#525252"
-        border.width: 0.75
+        // The dimming lives on the face so the attention dot below keeps full
+        // opacity on parked cards.
+        Rectangle {
+          id: cardFace
+          anchors.fill: parent
+          radius: 5
+          clip: true
+          opacity: card.landing ? 0.6 : card.window && !card.window.inView && !card.focused ? 0.48 : 1
+          color: card.focused || card.landing ? root.accent : cardMouse.containsMouse ? "#505050" : "#3d3d3d"
+          border.color: card.focused || card.landing ? "#be89c3" : "#525252"
+          border.width: 0.75
+          // The captions' natural widths come from font metrics, not the Texts'
+          // implicitWidth: that reads their layout, which follows the Column's
+          // width, which follows the thumbnail width this value sets (a binding loop).
+          TextMetrics { id: appNameMetrics; font: appName.font; text: appName.text }
+          TextMetrics { id: titleMetrics; font: windowTitle.font; text: windowTitle.text }
+          readonly property real appNameWidth: Math.ceil(appNameMetrics.advanceWidth)
+          readonly property real titleWidth: Math.ceil(titleMetrics.advanceWidth)
+          readonly property real priorCaptionWidth: Math.max(0, width - (icon.source.toString() ? 34 : 10) - 9)
+          // Preserve any caption that fit before; already elided text keeps a
+          // useful reading area instead of surrendering it to the thumbnail.
+          readonly property real captionNeeded: Math.max(
+            appNameWidth <= priorCaptionWidth ? appNameWidth : Math.min(120, priorCaptionWidth),
+            height >= 36 ? (titleWidth <= priorCaptionWidth ? titleWidth : Math.min(120, priorCaptionWidth)) : 0)
         Rectangle {
           visible: root.dragReorder && root.dragReorder.anchor === card.modelData
           x: root.vertical ? 0 : root.dragReorder && root.dragReorder.after ? card.width - 3 : 0
@@ -790,12 +861,6 @@ Rectangle {
           visible: card.badgeNumber > 0 && card.badgeNumber <= 9
           number: card.badgeNumber
         }
-        Accessible.role: Accessible.Button
-        Accessible.selected: selected
-        Accessible.name: window ? root.nameFor(window.app) + ", " + window.title
-          + (window.inView ? ", in current view" : ", offscreen")
-          + (badgeNumber > 0 && badgeNumber <= 9 ? ", number " + badgeNumber : "") : ""
-        Accessible.onPressAction: root.activated(modelData)
         Rectangle {
           anchors.fill: parent
           anchors.margins: 2
@@ -810,7 +875,7 @@ Rectangle {
           objectName: "mini-thumbnail-" + card.modelData
           readonly property bool tall: root.vertical && card.height >= 105
           x: 6; y: 4
-          width: tall ? card.width - 12 : Math.min(64, card.width - card.captionNeeded - 23)
+          width: tall ? card.width - 12 : Math.min(64, card.width - cardFace.captionNeeded - 23)
           height: tall ? Math.min(64, card.height - 44) : card.height - 8
           visible: root.thumbnailSource.toString() !== "" && (tall || width >= 32) && height >= 20
           address: card.modelData
@@ -933,6 +998,25 @@ Rectangle {
             background: Rectangle { color: "#272727"; radius: 5; border.color: "#707070" }
           }
         }
+        }
+        // Attention mark: a static dot in the top-left corner, clear of the
+        // number badge's top-right corner. Outside the dimming face so it
+        // keeps full opacity on parked cards; shape, position and the
+        // accessible suffix carry the meaning beside the color.
+        Shared.UrgentDot {
+          objectName: "mini-urgent-" + card.modelData
+          anchors { left: parent.left; top: parent.top; margins: 5 }
+          z: 3
+          visible: card.urgent
+        }
+        Accessible.role: Accessible.Button
+        Accessible.selected: card.selected
+        // Attention stays the final clause, even on numbered cards.
+        Accessible.name: card.window ? root.nameFor(card.window.app) + ", " + card.window.title
+          + (card.window.inView ? ", in current view" : ", offscreen")
+          + (card.badgeNumber > 0 && card.badgeNumber <= 9 ? ", number " + card.badgeNumber : "")
+          + (card.urgent ? ", needs attention" : "") : ""
+        Accessible.onPressAction: root.activated(card.modelData)
       }
     }
     Text {
@@ -946,6 +1030,32 @@ Rectangle {
       target: null
       onWheel: function(event) { root.scrollWheel(event); }
     }
+  }
+  // Landscape: the chips are vertically centred in the panel's 12 px side
+  // gutters, inset 3 px from the panel edge (the 1 px border plus 2 px clear).
+  // The gutter is narrower than a chip, so a chip overlaps the edge card's
+  // outer few px; its dot sits at the card's top-left, away from the centre.
+  // Portrait: the chips sit on the strip's end edges, over the edge card and
+  // centred on the strip. The rail has no free gutter (the count band holds
+  // the centred selection pill, the cards fill the strip, and reserving space
+  // would resize the ordinary layout), so the placement is accepted; the
+  // chips never touch the edge card's top-left dot or top-right number badge
+  // (tst_MiniStrip: test_parked_chips_hide_when_collapsed_and_clear_the_edge_card_marks).
+  ParkedCountChip {
+    objectName: "mini-parked-start"
+    side: root.vertical ? "above" : "left"
+    sideData: root.parkedUrgent.start
+    visible: strip.visible && counted > 0
+    x: root.vertical ? strip.x + (strip.width - width) / 2 : 3
+    y: root.vertical ? strip.y + 2 : strip.y + (strip.height - height) / 2
+  }
+  ParkedCountChip {
+    objectName: "mini-parked-end"
+    side: root.vertical ? "below" : "right"
+    sideData: root.parkedUrgent.end
+    visible: strip.visible && counted > 0
+    x: root.vertical ? strip.x + (strip.width - width) / 2 : parent.width - width - 3
+    y: root.vertical ? strip.y + strip.height - height - 2 : strip.y + (strip.height - height) / 2
   }
   Item {
     id: scrubber
@@ -1067,11 +1177,15 @@ Rectangle {
       id: countChip
       objectName: "mini-floating-count"
       readonly property bool focused: root.floats.some(function(w) { return w.address === root.focusedAddress; })
+      readonly property int urgentCount: root.floats.filter(function(w) {
+        return w.address !== root.focusedAddress && !!root.urgentAddresses[w.address];
+      }).length
       x: 4; y: 3
       width: countBody.width + 4
       height: 22
       Accessible.role: Accessible.Button
       Accessible.name: root.draggingSelection ? "Floating. Drop selected windows here" : "Floating windows, " + root.floats.length
+        + (urgentCount > 0 ? ", " + urgentCount + (urgentCount === 1 ? " needs attention" : " need attention") : "")
       Accessible.selected: focused
       Accessible.onPressAction: root.floatListOpen = !root.floatListOpen
       Rectangle {
@@ -1083,6 +1197,12 @@ Rectangle {
         color: countChip.focused ? root.floatAccent : Qt.rgba(1, 1, 1, 0.10)
         // The fill as seen, lift included; the glyph's front square masks with it.
         readonly property color shown: Qt.tint(countChip.focused ? root.floatAccent : countTab.color, Qt.rgba(1, 1, 1, 0.10))
+        Shared.UrgentDot {
+          objectName: "mini-floating-count-urgent"
+          anchors { right: parent.right; top: parent.top; rightMargin: -2; topMargin: -2 }
+          z: 5
+          visible: countChip.urgentCount > 0
+        }
         border.width: 1
         border.color: countChip.focused ? Qt.rgba(1, 1, 1, 0.9) : Qt.rgba(1, 0.62, 0.22, 0.75)
         Rectangle { anchors.fill: parent; radius: 4; visible: countChip.focused; color: Qt.rgba(1, 1, 1, 0.10) }
@@ -1177,15 +1297,23 @@ Rectangle {
             required property string modelData
             readonly property var window: root.windowFor(modelData)
             readonly property bool focused: modelData === root.focusedAddress
+            readonly property bool urgent: !focused && !!root.urgentAddresses[modelData]
             objectName: "mini-floating-row-" + modelData
             width: listColumn.width
             height: 30
             radius: 5
             color: focused ? Qt.rgba(1, 0.62, 0.22, 0.28) : rowMouse.containsMouse ? "#454545" : "transparent"
             Accessible.role: Accessible.Button
-            Accessible.name: window ? root.nameFor(window.app) + ", " + window.title : ""
+            Accessible.name: window ? root.nameFor(window.app) + ", " + window.title
+              + (urgent ? ", needs attention" : "") : ""
             Accessible.selected: focused
             Accessible.onPressAction: root.pickFloat(modelData)
+            Shared.UrgentDot {
+              objectName: "mini-floating-row-urgent-" + listRow.modelData
+              anchors { left: parent.left; top: parent.top; margins: 3 }
+              z: 5
+              visible: listRow.urgent
+            }
             FloatIcon { x: 8; anchors.verticalCenter: parent.verticalCenter; size: 16; app: listRow.window ? listRow.window.app : "" }
             Column {
               x: 32
@@ -1373,12 +1501,21 @@ Rectangle {
     required property string address
     readonly property var window: root.windowFor(address)
     readonly property bool focused: address === root.focusedAddress
+    readonly property bool urgent: !focused && !!root.urgentAddresses[address]
     objectName: "mini-floating-" + address
     width: 22; height: 22
     Accessible.role: Accessible.Button
-    Accessible.name: window ? root.nameFor(window.app) + ", " + window.title + ", floating window" : ""
+    Accessible.name: window ? root.nameFor(window.app) + ", " + window.title + ", floating window"
+      + (urgent ? ", needs attention" : "") : ""
     Accessible.selected: focused
     Accessible.onPressAction: root.activated(address)
+    Shared.UrgentDot {
+      objectName: "mini-floating-urgent-" + floatChip.address
+      // A badge over the chip's top-left corner. z puts it above the chip's
+      // body, which is declared after it and would otherwise cover most of it.
+      x: -2; y: -2; z: 5
+      visible: floatChip.urgent
+    }
     Rectangle {
       anchors.centerIn: parent
       width: 18; height: 18
@@ -1408,10 +1545,20 @@ Rectangle {
     // Addresses of the windows without chips.
     property var hidden: []
     readonly property var titles: hidden.map(function(address) { var w = root.windowFor(address); return w ? w.title : ""; })
+    readonly property int urgentCount: hidden.filter(function(address) {
+      return address !== root.focusedAddress && !!root.urgentAddresses[address];
+    }).length
     objectName: "mini-floating-overflow"
     width: 22; height: 22
     Accessible.role: Accessible.StaticText
     Accessible.name: hidden.length + " more floating windows: " + titles.join(", ")
+      + (urgentCount > 0 ? ", " + urgentCount + (urgentCount === 1 ? " needs attention" : " need attention") : "")
+    Shared.UrgentDot {
+      objectName: "mini-floating-overflow-urgent"
+      anchors { right: parent.right; top: parent.top; rightMargin: -2; topMargin: -2 }
+      z: 5
+      visible: overflowChip.urgentCount > 0
+    }
     Rectangle {
       anchors.centerIn: parent
       width: 18; height: 18
@@ -1429,5 +1576,45 @@ Rectangle {
     }
     HoverHandler { id: overflowHover }
     Tip { objectName: "mini-floating-overflow-tip"; visible: overflowHover.hovered; label: overflowChip.titles.join("\n") }
+  }
+  // Static count of the displayed row's urgent tiled windows parked beyond one
+  // viewport edge. Informational only: hover lists the titles, clicks pass
+  // through to the card beneath, and nothing navigates.
+  component ParkedCountChip: Rectangle {
+    id: parkedChip
+    required property string side
+    required property var sideData
+    readonly property int counted: sideData.count
+    width: Math.max(11, parkedCount.implicitWidth + 4)
+    height: 16
+    radius: 8
+    color: "#3d3d3d"
+    border.color: Theme.urgent
+    border.width: 1
+    visible: counted > 0
+    z: 3
+    Text {
+      id: parkedCount
+      anchors.centerIn: parent
+      text: String(parkedChip.counted)
+      textFormat: Text.PlainText
+      color: "#f4f4f4"
+      font.pixelSize: 10
+      font.bold: true
+    }
+    // A passive handler: the chip is text, never a control, so it takes no
+    // cursor and steals no hover from the card underneath.
+    HoverHandler {
+      id: parkedHover
+      objectName: "mini-parked-mouse-" + parkedChip.side
+    }
+    Tip {
+      objectName: "mini-parked-tip-" + parkedChip.side
+      visible: parkedHover.hovered
+      label: parkedChip.sideData.titles.join("\n")
+    }
+    Accessible.role: Accessible.StaticText
+    Accessible.name: counted + (counted === 1 ? " window needs attention " : " windows need attention ")
+      + (parkedChip.side === "above" || parkedChip.side === "below" ? parkedChip.side : "to the " + parkedChip.side)
   }
 }
